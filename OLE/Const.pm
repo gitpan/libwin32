@@ -1,6 +1,6 @@
-package Win32::OLE::Const;
-
 # The documentation is at the __END__
+
+package Win32::OLE::Const;
 
 use strict;
 use Carp;
@@ -8,31 +8,30 @@ use Win32::OLE;
 use Win32::Registry;
 
 sub import {
-    my ($self,$name,$major,$minor,$language) = @_;
-    return unless defined($name) && $name !~ /^\s*$/;
-    my $callpkg = caller(0);
-
-    my $const = $self->Load($name,$major,$minor,$language);
-    while (defined(my $key = each %$const)) {
-	# export only valid variable names
-	next unless $key =~ /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-	no strict 'refs';
-	*{"${callpkg}::${key}"} = \$const->{$key};
-    }
+    my ($self,$name,$major,$minor,$language,$codepage) = @_;
+    $self->Load($name,$major,$minor,$language,$codepage,scalar caller);
 }
 
 sub Load {
-    my ($pack,$name,$major,$minor,$language) = @_;
+    my ($pack,$name,$major,$minor,$language,$codepage,$caller) = @_;
     undef $minor unless defined $major;
 
-    return _Load($name,undef,undef,undef,undef)
+    return _Load($name,undef,undef,undef,undef,undef,undef)
       if UNIVERSAL::isa($name,'Win32::OLE');
+
+    unless (defined($name) && $name !~ /^\s*$/) {
+	carp "Win32::OLE::Const->Load: No or invalid type library name";
+	return;
+    }
 
     my ($hTypelib,$hClsid,$hVersion,$hLangid);
     my @found;
 
-    $main::HKEY_CLASSES_ROOT->Create('TypeLib',$hTypelib) 
-      or croak "Cannot access HKEY_CLASSES_ROOT\\Typelib";
+    unless ($main::HKEY_CLASSES_ROOT->Create('TypeLib',$hTypelib)) {
+	carp "Cannot access HKEY_CLASSES_ROOT\\Typelib";
+	return;
+    }
+
     my $Clsids = [];
     $hTypelib->GetKeys($Clsids);
 
@@ -84,7 +83,7 @@ sub Load {
     } @found;
 
     #printf "Loading %s\n", join(' ', @{$found[0]});
-    return _Load(@{$found[0]});
+    return _Load(@{$found[0]},$codepage,$caller);
 }
 
 1;
@@ -97,8 +96,8 @@ Win32::OLE::Const - Extract constant definitions from TypeLib
 
 =head1 SYNOPSIS
 
-    use Win32::OLE::Const ("Microsoft Excel");
-    print "xlMarkerStyleDot = $xlMarkerStyleDot\n";
+    use Win32::OLE::Const 'Microsoft Excel';
+    printf "xlMarkerStyleDot = %d\n", xlMarkerStyleDot;
 
     my $wd = Win32::OLE::Const->Load("Microsoft Word 8\\.0 Object Library");
     foreach my $key (keys %$wd) {
@@ -109,9 +108,9 @@ Win32::OLE::Const - Extract constant definitions from TypeLib
 
 This modules makes all constants from a registered OLE type library
 available to the Perl program. The constant definitions can be
-imported as scalar variables providing compile time name checking.
+imported as functions, providing compile time name checking.
 Alternatively the constants can be returned in a hash reference
-which avoids predefining various variables of unknown names and values.
+which avoids defining lots of functions of unknown names.
 
 =head2 Functions/Methods
 
@@ -163,7 +162,7 @@ Another advantage is that all available constants can now be enumerated.
 
 The load method also accepts an OLE object as a parameter. In this case
 the OLE object is queried about its containing type library and no registry
-search is done at all. Interestingly this seems to be slower thought.
+search is done at all. Interestingly this seems to be slower.
 
 =back
 
@@ -173,7 +172,7 @@ The first example imports all Excel constants names into the main namespace
 and prints the value of xlMarkerStyleDot (-4118).
 
     use Win32::OLE::Const ('Microsoft Excel 8.0 Object Library');
-    print "xlMarkerStyleDot = $xlMarkerStyleDot\n";
+    print "xlMarkerStyleDot = %d\n", xlMarkerStyleDot;
 
 The second example returns all Word constants in a hash ref.
 
@@ -188,7 +187,7 @@ The last example uses an OLE object to specify the type library:
 
     use Win32::OLE;
     use Win32::OLE::Const;
-    my $Excel = Win32::OLE->new('Excel.Application', sub {$_[0]->Quit;});
+    my $Excel = Win32::OLE->new('Excel.Application', 'Quit');
     my $xl = Win32::OLE::Const->Load($Excel);
 
 

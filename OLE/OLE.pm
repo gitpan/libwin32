@@ -1,87 +1,48 @@
-package Win32::OLE;
-
 # The documentation is at the __END__
 
+package Win32::OLE;
+
 use strict;
-use vars qw($VERSION @ISA @EXPORT @EXPORT_OK $AUTOLOAD);
+use vars qw($VERSION @ISA @EXPORT @EXPORT_OK @EXPORT_FAIL $AUTOLOAD
+	    $CP $LCID $Warn $LastError);
 
-$VERSION = '0.06';
+$VERSION = '0.08';
 
-# Do not "use Carp;", it pollutes the OLE namespace!
-# It must be required though, because the XS code uses
-# Carp::croak for error reporting!
-require Carp;
-
-# We import the variables from Win32::OLE::Variant before we export them again.
-# In the next version the user must "use Win32::OLE::Variant" directly.
-use Win32::OLE::Variant qw(!new !Variant);
-
+use Carp;
 use Exporter;
 use DynaLoader;
 @ISA = qw(Exporter DynaLoader);
 
-@EXPORT = qw(
-		Variant
-		VT_UI1
-		VT_I2
-		VT_I4
-		VT_R4
-		VT_R8
-		VT_DATE
-		VT_BSTR
-		VT_CY
-		VT_BOOL
-	    );
-@EXPORT_OK = qw(
-		VT_EMPTY
-		VT_NULL
-		VT_DISPATCH
-		VT_ERROR
-		VT_VARIANT
-		VT_UNKNOWN
-		VT_UI2
-		VT_UI4
-		VT_I8
-		VT_UI8
-		VT_INT
-		VT_UINT
-		VT_VOID
-		VT_HRESULT
-		VT_PTR
-		VT_SAFEARRAY
-		VT_CARRAY
-		VT_USERDEFINED
-		VT_LPSTR
-		VT_LPWSTR
-		VT_FILETIME
-		VT_BLOB
-		VT_STREAM
-		VT_STORAGE
-		VT_STREAMED_OBJECT
-		VT_STORED_OBJECT
-		VT_BLOB_OBJECT
-		VT_CF
-		VT_CLSID
-		TKIND_ENUM
-		TKIND_RECORD
-		TKIND_MODULE
-		TKIND_INTERFACE
-		TKIND_DISPATCH
-		TKIND_COCLASS
-		TKIND_ALIAS
-		TKIND_UNION
-		TKIND_MAX
-		With
-	       );
+@EXPORT = qw();
+@EXPORT_OK = qw(CP_ACP CP_OEMCP in valof with OVERLOAD);
+@EXPORT_FAIL = qw(OVERLOAD);
+
+sub export_fail {
+    shift;
+    if ($_[0] eq 'OVERLOAD') {
+	shift;
+	eval <<'OVERLOAD';
+	    use overload '""'     => \&valof,
+	                 '0+'     => \&valof,
+	                 fallback => 1;
+OVERLOAD
+    }
+    return @_;
+}
 
 bootstrap Win32::OLE;
+sub END { Win32::OLE->Uninitialize(); }
+
+$Warn = 1;
+
+sub CP_ACP {0;}    # ANSI codepage
+sub CP_OEMCP {1;}  # OEM codepage
 
 # The following class methods are pure XS code. They will delegate
 # to Dispatch when called as object methods.
 #
-# - new(oleclass,destroy)
-# - LastError()
-# - GetActiveObject(oleclass)
+# - new(progid,destroy)
+# - GetActiveObject(progid)
 # - GetObject(pathname)
 # - QueryObjectType(object)
 #
@@ -89,62 +50,94 @@ bootstrap Win32::OLE;
 # - DESTROY()
 #
 
-# <compatibility> (deprecated, will be gone in next version)
-sub GetProperty {
-    Carp::carp("Use of Win32::OLE::GetProperty is deprecated") if $^W;
-    # GetProperty($object,$varName,$varReturn)
-    local $^W = 1;
-    eval { $_[2] = $_[0]->{$_[1]}; };
-    return !$@;
-}
 
-sub SetProperty {
-    Carp::carp("Use of Win32::OLE::SetProperty is deprecated") if $^W;
-    # SetProperty($object,$varName,$varValue)
-    local $^W = 1;
-    eval { $_[0]->{$_[1]} = $_[2]; };
-    return !$@;
-}
-
-*OLECreateObject = \&new;
-*Win32::OLELastError = \&Win32::OLE::LastError;
-*Win32::OLECreateObject = \&Win32::OLE::CreateObject;
-#*Win32::OLEDestroyObject = \&Win32::OLE::DestroyObject;
-*Win32::OLEDispatch = \&Win32::OLE::Dispatch;
-*Win32::OLEGetProperty = \&Win32::OLE::GetProperty;
-*Win32::OLESetProperty = \&Win32::OLE::SetProperty;
-
-# </compatibility>
-
+# CreateObject is defined here because it is documented in the
+# "Learning Perl on Win32 Systems" book. Please use Win32::OLE->new().
 sub CreateObject {
     if (ref($_[0]) && UNIVERSAL::isa($_[0],'Win32::OLE')) {
 	$AUTOLOAD = 'CreateObject';
 	goto &AUTOLOAD;
     }
-    # $Success = Win32::OLE->CreateObject($Class,$Object);
+
     $_[1] = Win32::OLE->new($_[0]);
     return defined $_[1];
+}
+
+sub LastError {
+    unless (defined $_[0]) {
+	# Win32::OLE::LastError() will always return $Win32::OLE::LastError
+	return $LastError;
+    }
+
+    if (ref($_[0]) && UNIVERSAL::isa($_[0],'Win32::OLE')) {
+	$AUTOLOAD = 'LastError';
+	goto &AUTOLOAD;
+    }
+
+    no strict 'refs';
+    my $LastError = "$_[0]::LastError";
+    $$LastError = $_[1] if defined $_[1];
+    return $$LastError;
+}
+
+sub Invoke {
+    my ($self, $method, @args) = @_;
+    my $retval;
+    $self->Dispatch($method, $retval, @args);
+    return $retval;
 }
 
 sub AUTOLOAD {
     my $self = shift;
     my $retval;
-    $AUTOLOAD =~ s/.*:://;
-    Carp::croak("Cannot autoload class method \"$AUTOLOAD\"") 
-      unless ref($self) && UNIVERSAL::isa($self,'Win32::OLE');
-    $self->Dispatch($AUTOLOAD, $retval, @_);
+    $AUTOLOAD =~ s/.*:://o;
+    croak("Cannot autoload class method \"$AUTOLOAD\"") 
+      unless ref($self) && UNIVERSAL::isa($self, 'Win32::OLE');
+    my $success = $self->Dispatch($AUTOLOAD, $retval, @_);
+    unless (defined $success || ($^H & 0x200)) {
+	# Retry default method if C<no strict 'subs';>
+	$self->Dispatch(undef, $retval, $AUTOLOAD, @_);
+    }
     return $retval;
 }
 
-sub Variant {
-    if (ref($_[0]) && UNIVERSAL::isa($_[0],'Win32::OLE')) {
-	$AUTOLOAD = 'Variant';
-	goto &AUTOLOAD;
+sub in {
+    my @res;
+    require Win32::OLE::Enum;
+    while (@_) {
+	my $this = shift;
+	if (UNIVERSAL::isa($this, 'Win32::OLE')) {
+	    push @res, Win32::OLE::Enum->All($this);
+	}
+	elsif (ref($this) eq 'ARRAY') {
+	    push @res, @$this;
+	}
+	else {
+	    push @res, $this;
+	}
     }
-    return Win32::OLE::Variant->new(@_);
+    return @res;
 }
 
-sub With {
+sub valof {
+    require Win32::OLE::Variant;
+    my $arg = shift;
+    if (UNIVERSAL::isa($arg, 'Win32::OLE')) {
+	my ($class) = overload::StrVal($arg) =~ /^([^=]+)=/;
+	no strict 'refs';
+	local $Win32::OLE::Variant::CP = $ {$class."::CP"};
+	local $Win32::OLE::Variant::LCID = $ {$class."::LCID"};
+	use strict 'refs';
+	# VT_EMPTY variant for return code
+	my $variant = Win32::OLE::Variant->new(0,0);
+	$arg->Dispatch(undef, $variant);
+	return $variant->Value;
+    }
+    $arg = $arg->Value if UNIVERSAL::can($arg, 'Value');
+    return $arg;
+}
+
+sub with {
     my $object = shift;
     while (@_) {
 	my $property = shift;
@@ -152,7 +145,25 @@ sub With {
     }
 }
 
+########################################################################
+
+package Win32::OLE::Tie;
+
+# Only retry default method under C<no strict 'subs';>
+
+sub FETCH {
+    my ($self,$key) = @_;
+    $self->Fetch($key, ~($^H & 0x200));
+}
+
+sub STORE {
+    my ($self,$key,$value) = @_;
+    $self->Store($key, $value, ~($^H & 0x200));
+}
+
 1;
+
+########################################################################
 
 __END__
 
@@ -181,16 +192,16 @@ The Win32::OLE module uses the IDispatch interface exclusively. It is
 not possible to access a custom OLE interface. OLE events and OCX's are
 currently not supported.
 
-=head2 Functions/Methods
+=head2 Methods
 
 =over 8
 
-=item Win32::OLE->new(CLASS [, DESTRUCTOR])
+=item Win32::OLE->new(PROGID [, DESTRUCTOR])
 
-OLE Automation objects are created using the new() method, the
-second argument to which must be the OLE class of the application
-to create.  Return value is undef if the attempt to create an
-OLE connection failed for some reason. The optional third argument
+OLE Automation objects are created using the new() method, the second
+argument to which must be the OLE program id or class id of the
+application to create.  Return value is undef if the attempt to create
+an OLE connection failed for some reason. The optional third argument
 specifies a DESTROY-like method. This can be either a CODE reference
 or a string containing an OLE method name. It can be used to cleanly
 terminate OLE objects in case the Perl program dies in the middle of
@@ -230,18 +241,147 @@ The GetObject class method returns an OLE reference to the specified
 object. The object is specified by a pathname optionally followed by
 additional item subcomponent separated by exclamation marks '!'.
 
+=item OBJECT->Invoke(METHOD,ARGS)
+
+The C<Invoke> object method is an alternate way to invoke OLE
+methods. It is normally equivalent to C<$OBJECT->METHOD(@ARGS)>. This
+function must be used if the METHOD name contains characters not valid
+in a Perl variable name (like foreign language characters). It can
+also be used to invoke the default method of an object even if the
+default method has not been given a name in the type library. In this
+case use <undef> or C<''> as the method name.
+
+=item Win32::OLE->LastError()
+
+The C<LastError> class method returns the last recorded OLE
+error. This is a dual value like the C<$!> variable: in a numeric
+context it returns the error number and in a string context it returns
+the error message.
+
+The last OLE error is automatically reset by a successful OLE
+call. The numeric value can also explicitly be set by a call (which will
+discard the string value):
+
+	Win32::OLE->LastError(0);
+
 =item Win32::OLE->QueryObjectType(OBJECT)
 
 The QueryObjectType class method returns a list of the type library
 name and the objects class name. In a scalar context it returns the
-class name only.
+class name only. It returns C<undef> when the type information is not
+available.
 
-=item With(OBJECT, PROPERTYNAME => VALUE, ...)
+=back
 
-This utility function provides a concise way to set multiple properties
-on an object.  It iterates over its arguments doing
-C<$OBJECT->{PROPERTYNAME} = $VALUE> on each trailing pair.  This
-function is not exported by default.
+Whenever Perl does not find a method name in the Win32::OLE package it
+is automatically used as the name of an OLE method and this method call
+is dispatched to the OLE server.
+
+There is one special hack built into the module: If a method or property 
+name could not be resolved with the OLE object, then the default method
+of the object is called with the method name as its first parameter. So
+
+	my $Sheet = $Worksheets->Table1;
+or
+	my $Sheet = $Worksheets->{Table1};
+
+is resolved as
+
+	my $Sheet = $Worksheet->Item('Table1');
+
+provided that the C<$Worksheets> object doesnot have a C<Table1> method
+or property. This hack has been introduced to call the default method
+of collections which did not name the method in their type library. The
+recommended way to call the "unnamed" default method is:
+
+	my $Sheet = $Worksheets->Invoke('', 'Table1');
+
+This special hack is disabled under C<use strict 'subs';>.
+
+=head2 Functions
+
+The following functions are not exported by default.
+
+=over 8
+
+=item in(COLLECTION)
+
+If COLLECTION is an OLE collection object then C<in $COLLECTION>
+returns a list of all members of the collection. This is a shortcut
+for C<Win32::OLE::Enum->All($COLLECTION)>. It is most commonly used in
+a C<foreach> loop:
+
+	foreach my $value (in $collection) {
+	    # do something with $value here
+	}
+
+=item valof(OBJECT)
+
+Normal assignment of Perl OLE objects creates just another reference
+to the OLE object. The C<valof> function explictly dereferences the
+object (through the default method) and returns the value of the object.
+
+	my $RefOf = $Object;
+	my $ValOf = valof $Object;
+        $Object->{Value} = $NewValue;
+
+Now C<$ValOf> still contains the old value wheras C<$RefOf> would
+resolve to the C<$NewValue> because it is still a reference to
+C<$Object>.
+
+The C<valof> function can also be used to convert Win32::OLE::Variant
+objects to Perl values.
+
+=item with(OBJECT, PROPERTYNAME => VALUE, ...)
+
+This function provides a concise way to set the values of multiple
+properties of an object.  It iterates over its arguments doing
+C<$OBJECT->{PROPERTYNAME} = $VALUE> on each trailing pair.
+
+=back
+
+=head2 Overloading
+
+The Win32::OLE objects can be overloaded to automatically convert to
+their values whenever they are used in a bool, numeric or string
+context. This is not enabled by default. You have to request it
+through the C<OVERLOAD> pseudotarget:
+
+	use Win32::OLE qw(in valof with OVERLOAD);
+
+Please note that this is a global setting. If any module enables
+Win32::OLE overloading then it's active everywhere.
+
+=head2 Class Variables
+
+=over 8
+
+=item $Win32::OLE::CP
+
+This variable is used to determine the codepage used by all
+translations between Perl strings and Unicode strings used by the OLE
+interface. The default value is CP_ACP, which is the default ANSI
+codepage. It can also be set to CP_OEMCP which is the default OEM
+codepage. Both constants are not exported by default.
+
+=item $Win32::OLE::LCID
+
+This variable controls the locale idnetifier used for all OLE calls.
+It is set to LOCALE_NEUTRAL by default. Please check the
+L<Win32::OLE::NLS> module for other locale related information.
+
+=item $Win32::OLE::Warn
+
+This variable determines the behavior of the Win32::OLE module when
+an error happens. Valid values are:
+
+	0	Ignore error, return undef
+	1	Carp::carp if $^W is set (-w option)
+	2	always Carp::carp
+	3	Carp::croak
+
+The error number and message (without Carp line/module info) are
+available through the C<Win32::OLE->LastError> class method.
 
 =back
 
@@ -250,12 +390,13 @@ function is not exported by default.
 Here is a simple Microsoft Excel application.
 
 	use Win32::OLE;
-	
+
 	# use existing instance if Excel is already running
 	eval {$ex = Win32::OLE->GetActiveObject('Excel.Application')};
-	if ($@) {
+	die "Excel not installed" if $@;
+	unless (defined $ex) {
 	    $ex = Win32::OLE->new('Excel.Application', sub {$_[0]->Quit;})
-		    or die "oops\n";
+		    or die "Oops, cannot start Excel";
 	}
 	
 	# open an existing workbook
@@ -268,11 +409,11 @@ Here is a simple Microsoft Excel application.
         # write a 2 rows by 3 columns range
         $sheet->Range("A8:C9")->{Value} = [[ undef, 'Xyzzy', 'Plugh' ],
                                            [ 42,    'Perl',  3.1415  ]];
-	
+
         # print "XyzzyPerl"
         $array = $sheet->Range("A8:B9")->{Value};
         print $array[0][1] . $array[1][1];
-	
+
 	# save and exit
 	$book->Save;
 	undef $book;
@@ -384,6 +525,12 @@ as the following example demonstrates:
 	
 	1;
 
+This package inherits the constructor C<new()> from the Win32::OLE
+package. It is important to note that you cannot later rebless a
+Win32::OLE object as some information about the package is cached by
+the object. Always invoke the C<new()> constructor through the right
+package!
+
 Here's how the above class will be used:
 
 	use Win32::OLE::Strict;
@@ -446,8 +593,10 @@ arguments are still subject to locale specific interpretation. Perl uses the
 system default locale for all OLE transaction whereas Visual Basic uses a 
 type library specific locale. A Visual Basic script would use "R1C1" in string
 arguments to specify relative references. A Perl script running on a German
-language Windows would have to use "Z1S1". The next version of Win32::OLE will
-allow writing more portable scripts in this regard.
+language Windows would have to use "Z1S1". Set the C<$Win32::OLE::LCID> class
+variable to an English locale to write portable scripts. This variable should
+not be changed after creating the OLE objects; some methods seem to randomly
+fail if the locale is changed on the fly.
 
 =item SaveAs method in Word 97 doesn't work
 
@@ -457,6 +606,15 @@ well. A workaround is to use the WordBasic compatibility object. It doesn't
 support all the options of the native method though.
 
     $Word->WordBasic->FileSaveAs($file);
+
+The problem seems to be fixed by applying the Office 97 Service Release 1.
+
+=item Randomly failing method calls
+
+It seems like modifying objects that are not selected/activated is sometimes
+fragile. Most of these problems go away if the chart/sheet/document is
+selected or activated before being manipulated (just like an interactive
+user would automatically do it).
 
 =back
 
@@ -536,23 +694,6 @@ in future, to allow the user to control which conditions are fatal.
 
 =back
 
-=head2 Deprecated features
-
-=over 8
-
-=item 1
-
-All C<Win32::OLE*> (but not C<Win32::OLE::*>) methods will be removed in the
-next release. The C<GetProperty> and C<SetProperty> methods will be removed
-too. They were always undocumented and at least C<SetProperty> also didn't
-really seem to work anyways.
-
-=item 2
-
-The Variant functions and constants have been moved into the separate module
-Win32::OLE::Variant. Starting with the next release the variant functions
-and constants will be only available through that package.
-
 =back
 
 =head1 AUTHORS
@@ -571,15 +712,15 @@ added support for named parameters, and other significant enhancements.
     (c) 1995 Microsoft Corporation. All rights reserved. 
 	Developed by ActiveWare Internet Corp., http://www.ActiveWare.com
 
-    Other modifications (c) 1997 by Gurusamy Sarathy <gsar@umich.edu>
-    and Jan Dubois <jan.dubois@ibm.net>
+    Other modifications Copyright (c) 1997, 1998 by Gurusamy Sarathy
+    <gsar@umich.edu> and Jan Dubois <jan.dubois@ibm.net>
 
     You may distribute under the terms of either the GNU General Public
     License or the Artistic License, as specified in the README file.
 
 =head1 VERSION
 
-Version 0.06	6 February 1998
+Version 0.08	11 May 1998
 
 =cut
 
