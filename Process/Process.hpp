@@ -4,6 +4,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#ifndef _WIN64
+#  define DWORD_PTR	DWORD
+#  define PDWORD_PTR	DWORD*
+#endif
+
 typedef BOOL (*LPSetProcessAffinityMask)(HANDLE, DWORD);
 
 class cProcess
@@ -21,7 +26,7 @@ public:
 
     BOOL    bRetVal;
     cProcess(char* szAppName, char* szCommLine, BOOL Inherit,
-	      DWORD CreateFlags, char* szCurrDir)
+	      DWORD CreateFlags, void *env, char* szCurrDir)
     {
 	STARTUPINFOA st;
 	PROCESS_INFORMATION	procinfo;
@@ -37,7 +42,7 @@ public:
 	th = NULL;
 
 	bRetVal = CreateProcessA(szAppName,szCommLine,NULL,NULL,
-				 Inherit,CreateFlags,NULL,szCurrDir,
+				 Inherit,CreateFlags,env,szCurrDir,
 				 &st,&procinfo);
 
 	if (bRetVal) {
@@ -82,6 +87,31 @@ public:
 	if (hLib != NULL)
 		pSetProcessAffinityMask = (LPSetProcessAffinityMask)GetProcAddress(hLib, "SetProcessAffinityMask");
     }
+
+    cProcess(DWORD pid_, BOOL Inherit)
+    {
+	ph      = NULL;
+	th      = NULL;
+	pid     = 0;
+	bRetVal = 0;
+
+	pSetProcessAffinityMask = NULL;
+	hLib = LoadLibrary("kernel32.dll");
+	if (hLib != NULL)
+		pSetProcessAffinityMask = (LPSetProcessAffinityMask)GetProcAddress(hLib, "SetProcessAffinityMask");
+
+	HANDLE ph_ = OpenProcess(PROCESS_DUP_HANDLE        |
+				 PROCESS_QUERY_INFORMATION |
+				 PROCESS_SET_INFORMATION   |
+				 PROCESS_TERMINATE,
+				 Inherit, pid_);
+	if (NULL == ph_) {
+	    return;
+	}
+	ph      = ph_;
+	bRetVal = 1;
+    }
+
     ~cProcess()
     {
 	CloseHandle( th );
@@ -91,9 +121,9 @@ public:
     BOOL Kill(UINT uExitCode)
 	{ return TerminateProcess( ph, uExitCode ); }
     BOOL Suspend()
-	{ return SuspendThread( th ); }
+	{ return th ? SuspendThread( th ) : 0; }
     BOOL Resume()
-	{ return ResumeThread( th ); }
+	{ return th ? ResumeThread( th ) : 0; }
     BOOL GetPriorityClass( DWORD* pdwPriorityClass )
     {
 	(*pdwPriorityClass) = ::GetPriorityClass(ph);
@@ -101,7 +131,7 @@ public:
     }
     BOOL SetPriorityClass( DWORD dwPriorityClass )
 	{ return ::SetPriorityClass( ph, dwPriorityClass ); }
-    BOOL GetProcessAffinityMask( DWORD* pdwProcessAffinityMask, DWORD* pdwSystemAffinityMask )
+    BOOL GetProcessAffinityMask( PDWORD_PTR pdwProcessAffinityMask, PDWORD_PTR pdwSystemAffinityMask )
 	{ return ::GetProcessAffinityMask( ph, pdwProcessAffinityMask, pdwSystemAffinityMask ); }
     BOOL SetProcessAffinityMask( DWORD dwProcessAffinityMask )
     {

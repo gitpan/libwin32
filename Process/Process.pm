@@ -4,7 +4,7 @@ require Exporter;
 require DynaLoader;
 @ISA = qw(Exporter DynaLoader);
 
-$VERSION = '0.07';
+$VERSION = '0.09';
 
 # Items to export into callers namespace by default. Note: do not export
 # names by default without a very good reason. Use EXPORT_OK instead.
@@ -79,7 +79,8 @@ Win32::Process - Create and manipulate processes.
 
 =head1  DESCRIPTION
 
-This module allows for control of processes in Perl.
+This module provides access to the process control functions in the
+Win32 API.
 
 =head1 METHODS
 
@@ -98,10 +99,21 @@ Creates a new process.
 	$cflags		flags for creation (see exported vars below)
 	$curdir		working dir of new process
 
+Returns non-zero on success, 0 on failure.
+
+=item Win32::Process::Open($obj,$pid,$iflags)
+
+Creates a handle Perl can use to an existing process as identified by $pid.
+The $iflags is the inherit flag that is passed to OpenProcess.  Currently
+Win32::Process objects created using Win32::Process::Open cannot Suspend
+or Resume the process.  All other calls should work.
+
+Win32::Process::Open returns non-zero on success, 0 on failure.
+
 =item Win32::Process::KillProcess($pid, $exitcode)
 
-Terminates any process identified by $pid.  The process will exit
-with $exitcode.
+Terminates any process identified by $pid.  $exitcode will be set to
+the exit code of the process.
 
 =item $ProcessObj->Suspend()
 
@@ -111,9 +123,9 @@ Suspend the process associated with the $ProcessObj.
 
 Resume a suspended process.
 
-=item $ProcessObj->Kill( $ExitCode )
+=item $ProcessObj->Kill( $exitcode )
 
-Kill the associated process, have it die with exit code $ExitCode.
+Kill the associated process, have it terminate with exit code $ExitCode.
 
 =item $ProcessObj->GetPriorityClass($class)
 
@@ -133,19 +145,48 @@ represents the processors that a process is allowed to run on.
 
 Set the process affinity mask.  Only available on Windows NT.
 
-=item $ProcessObj->GetExitCode( $ExitCode )
+=item $ProcessObj->GetExitCode( $exitcode )
 
 Retrieve the exitcode of the process.
 
-=item $ProcessObj->Wait($Timeout)
+=item $ProcessObj->Wait($timeout)
 
-Wait for the process to die. forever = INFINITE
+Wait for the process to die.  $timeout should be specified in milliseconds.
+To wait forever, specify the constant C<INFINITE>.
 
 =item $ProcessObj->GetProcessID()
 
 Returns the Process ID.
 
 =back
+
+=head1 EXPORTS
+
+The following constants are exported by default.
+
+	CREATE_DEFAULT_ERROR_MODE
+	CREATE_NEW_CONSOLE
+	CREATE_NEW_PROCESS_GROUP
+	CREATE_NO_WINDOW
+	CREATE_SEPARATE_WOW_VDM
+	CREATE_SUSPENDED
+	CREATE_UNICODE_ENVIRONMENT
+	DEBUG_ONLY_THIS_PROCESS
+	DEBUG_PROCESS
+	DETACHED_PROCESS
+	HIGH_PRIORITY_CLASS
+	IDLE_PRIORITY_CLASS
+	INFINITE
+	NORMAL_PRIORITY_CLASS
+	REALTIME_PRIORITY_CLASS
+	THREAD_PRIORITY_ABOVE_NORMAL
+	THREAD_PRIORITY_BELOW_NORMAL
+	THREAD_PRIORITY_ERROR_RETURN
+	THREAD_PRIORITY_HIGHEST
+	THREAD_PRIORITY_IDLE
+	THREAD_PRIORITY_LOWEST
+	THREAD_PRIORITY_NORMAL
+	THREAD_PRIORITY_TIME_CRITICAL
 
 =cut
 

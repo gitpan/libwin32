@@ -95,9 +95,20 @@ foreach (keys %$NewShare) {
 
 $Aref=[];
 
+my $host = {
+    Scope       => RESOURCE_GLOBALNET,
+    Type        => RESOURCETYPE_DISK,
+    DisplayType => RESOURCEDISPLAYTYPE_SHARE,
+    Usage       => RESOURCEUSAGE_CONNECTABLE,
+    LocalName   => '',
+    RemoteName  => '\\\\' . Win32::NodeName(),
+    Comment     => '',
+    Provider    => '',
+};
+
 deb("testing GetSharedResources");
 
-Win32::NetResource::GetSharedResources($Aref,0);
+Win32::NetResource::GetSharedResources($Aref,0,$host) or print "not ";
 print "ok 4\n";
 err();
 
@@ -118,22 +129,27 @@ foreach $href (@$Aref) {
     $myRef = $href if $href->{'RemoteName'} =~ /PerlTempShare/;
 }
 
-$drive = Win32::GetNextAvailDrive();
 #$drive = 'I:';
-$myRef->{'LocalName'} = $drive;
-#print STDERR "mapping to |$drive|\n", Dumper($myRef), "\n";
-Win32::NetResource::AddConnection($myRef,$passwd,$user,0);
-err();
+$drive = Win32::GetNextAvailDrive();
+deb("drive is $drive");
+if (keys %$myRef) {
+    $myRef->{'LocalName'} = $drive;
+    #print STDERR "mapping to |$drive|\n", Dumper($myRef), "\n";
+    Win32::NetResource::AddConnection($myRef,$passwd,$user,0);
+    err();
 
-Win32::NetResource::GetUNCName( $UNCName, $drive ) or print "not ";
-print "ok 5\n";
-err();
-deb("uncname is $UNCName");
+    Win32::NetResource::GetUNCName( $UNCName, $drive ) or print "not ";
+    print "ok 5\n";
+    err();
+    deb("uncname is $UNCName");
 
-Win32::NetResource::CancelConnection($drive,0,1) or print "not ";
-print "ok 6\n";
-err();
-
+    Win32::NetResource::CancelConnection($drive,0,1) or print "not ";
+    print "ok 6\n";
+    err();
+}
+else {
+    print "ok $_ # skipped: share not found\n" for 5..6;
+}
 Win32::NetResource::NetShareDel("PerlTempShare") or print "not ";
 print "ok 7\n";
 err();

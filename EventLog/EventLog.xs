@@ -289,7 +289,7 @@ OUTPUT:
 
 bool
 ReadEventLog(handle,Flags,Record,evtHeader,sourceName,computerName,sid,data,strings)
-    U32 handle
+    size_t handle
     DWORD Flags
     DWORD Record
     char *evtHeader = NO_INIT
@@ -414,24 +414,27 @@ CODE:
     HKEY hk;
     int length = SvCUR(ST(2))+1;
 
+    /* XXX TODO:
+     * XXX ParameterMessageFile can also be a semicolon separated list of files
+     * XXX What about expanding the category id to a string?
+     * XXX Determining the log category is kind of bogus!
+     * XXX This should have been a parameter.
+     */
+
     if (USING_WIDE()) {
 	static const WCHAR *wEVFILE[] = {L"System", L"Security", L"Application"};
 	WCHAR *ptr, *tmpx;
-	WCHAR wmsgfile[MAX_PATH], wregPath[MAX_PATH], *wstrings[16];
+	WCHAR wmsgfile[MAX_PATH], wregPath[MAX_PATH], **wstrings;
 	WCHAR wsource[MAX_PATH+1], *wMsgBuf, *wlongstring;
+        WCHAR *wmessage = NULL;
 	char *MsgBuf;
-	DWORD i, id2;
+	DWORD i, id2, maxinsert;
 	BOOL result;
 	LONG lResult;
 	unsigned short j;
 	WCHAR *percent;
 	int percentLen, msgLen;
 
-	/* Which EventLog are we reading? */
-	New(0, wlongstring, length, WCHAR);
-
-	wlongstring[0] = 0;
-        A2WHELPER_LEN(longstring, length, wlongstring, length*sizeof(WCHAR));
         A2WHELPER(source, wsource, sizeof(wsource));
 
 	for (j=0; j < (sizeof(wEVFILE)/sizeof(wEVFILE[0])); j++) {
@@ -448,8 +451,71 @@ CODE:
 	if (j >= (sizeof(wEVFILE)/sizeof(wEVFILE[0])))
 	    XSRETURN_NO;
 
+        /* Get the (list of) message file(s) for this entry */
+	i = sizeof(wregPath);
+	lResult = RegQueryValueExW(hk, L"EventMessageFile", 0, 0,
+				   (unsigned char *)wregPath, &i);
+	if (lResult != ERROR_SUCCESS) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+	if (ExpandEnvironmentStringsW(wregPath, wmsgfile, sizeof(wmsgfile)) == 0) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+        /* Try to retrieve message *without* expanding the inserts yet */
+        ptr = wmsgfile;
+        while (ptr && !wmessage) {
+            WCHAR *semi = wcschr(ptr, L';');
+            if (semi)
+                *semi++ = '\0';
+            dll = LoadLibraryExW(ptr, 0, LOAD_LIBRARY_AS_DATAFILE);
+            if (dll) {
+                FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                               FORMAT_MESSAGE_FROM_HMODULE    |
+                               FORMAT_MESSAGE_IGNORE_INSERTS,
+                               dll, id, 0, (LPWSTR)&wmessage, 0, NULL);
+                FreeLibrary(dll);
+            }
+            ptr = semi;
+        }
+	if (!wmessage) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+        /* Determine higest %n insert number */
+        maxinsert = numstrings;
+        ptr = wmessage;
+        while ((percent=wcschr(ptr, L'%'))
+               && swscanf(percent, L"%%%d", &id2) == 1)
+        {
+            if (id2 > maxinsert)
+                maxinsert = id2;
+            ptr = percent + 1;
+        }
+
+        New(0, wstrings, maxinsert, WCHAR*);
+
+        /* Allocate dummy strings for inserts not provided by caller */
+        for (j=numstrings; j<maxinsert; ++j) {
+            New(0, tmpx, 10, WCHAR);
+            swprintf(tmpx, L"%%%d", j+1);
+            wstrings[j] = tmpx;
+        }
+
+	i = sizeof(wregPath);	/* Fixed */
+
+	/* Which EventLog are we reading? */
+	New(0, wlongstring, length, WCHAR);
+
+	wlongstring[0] = 0;
+        A2WHELPER_LEN(longstring, length, wlongstring, length*sizeof(WCHAR));
+
 	ptr = wlongstring;
-	for (j=0; j<=numstrings; j++) {
+	for (j=0; j<numstrings; j++) {
 	    wstrings[j] = ptr;
 
 	    ptr += wcslen(ptr)+1;
@@ -480,67 +546,56 @@ CODE:
 			RegCloseKey(hk);
 			XSRETURN_NO;
 		    }
+                }
 
-		    if (FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER
-				       | FORMAT_MESSAGE_FROM_HMODULE
-				       | FORMAT_MESSAGE_ARGUMENT_ARRAY,
-				       dll, id2, 0, (LPWSTR)&wMsgBuf, 0,
-				       (va_list*)&wstrings[j]) == 0)
-		    {
-			FreeLibrary(dll);
-			RegCloseKey(hk);
-			XSRETURN_NO;
-		    }
+                if (FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER
+                                   | FORMAT_MESSAGE_FROM_HMODULE
+                                   | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                                   dll, id2, 0, (LPWSTR)&wMsgBuf, 0,
+                                   (va_list*)&wstrings[j]) == 0)
+                {
+                    FreeLibrary(dll);
+                    RegCloseKey(hk);
+                    XSRETURN_NO;
+                }
 
-		    percentLen = 2;	/* for %% */
-		    do {
-			percentLen++;
-		    } while (id2/=10);	/* compute length of %%xxx string */
+                percentLen = 2;	/* for %% */
+                do {
+                    percentLen++;
+                } while (id2/=10);	/* compute length of %%xxx string */
 
-		    msgLen = wcslen(wMsgBuf);
-		    Newz(0, tmpx, wcslen(wstrings[j])+msgLen-percentLen+1, WCHAR);
-		    wcsncpy(tmpx, wstrings[j], percent-wstrings[j]);
-		    wcsncat(tmpx, wMsgBuf,
-			    msgLen - ((wcscmp(wMsgBuf+msgLen-2, L"\r\n")==0) ? 2 : 0));
-		    wcscat(tmpx, percent+percentLen);
-		    wstrings[j] = tmpx;
-		    LocalFree(wMsgBuf);
-		}
+                msgLen = wcslen(wMsgBuf);
+                Newz(0, tmpx, wcslen(wstrings[j])+msgLen-percentLen+1, WCHAR);
+                wcsncpy(tmpx, wstrings[j], percent-wstrings[j]);
+                wcsncat(tmpx, wMsgBuf,
+                        msgLen - ((wcscmp(wMsgBuf+msgLen-2, L"\r\n")==0) ? 2 : 0));
+                wcscat(tmpx, percent+percentLen);
+                wstrings[j] = tmpx;
+                LocalFree(wMsgBuf);
 	    }
 	}
 
-	if (dll)
+        RegCloseKey(hk);
+        if (dll)
 	    FreeLibrary(dll); /* in case it was used above */
-
-	i = sizeof(wregPath);
-	lResult = RegQueryValueExW(hk, L"EventMessageFile", 0, 0,
-				   (unsigned char *)wregPath, &i);
-
-	RegCloseKey(hk);
-
-	if (lResult != ERROR_SUCCESS)
-	    XSRETURN_NO;
-
-	if (ExpandEnvironmentStringsW(wregPath, wmsgfile, sizeof(wmsgfile)) == 0)
-	    XSRETURN_NO;
-
-	dll = LoadLibraryExW(wmsgfile, 0, LOAD_LIBRARY_AS_DATAFILE);
-	if (!dll)
-	    XSRETURN_NO;
 
 	/* XXX 'strings' argument may be broken on 64-bit
 	     * platforms since the documentation says 32-bit
 	     * values are required */
-	result = (FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER
-				 | FORMAT_MESSAGE_FROM_HMODULE
-				 | FORMAT_MESSAGE_ARGUMENT_ARRAY,
-				 dll, id, 0, (LPWSTR)&wMsgBuf, 0,
+	result = (FormatMessageW(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+				 FORMAT_MESSAGE_FROM_STRING |
+				 FORMAT_MESSAGE_ARGUMENT_ARRAY,
+				 wmessage, 0, 0, (LPWSTR)&wMsgBuf, 0,
 				 (va_list*)wstrings) > 0);
 
-	for (j=0; j<=numstrings; j++)
+	LocalFree(wmessage);
+
+	for (j=0; j<maxinsert; j++)
 	    if (wstrings[j] < wlongstring || wstrings[j] >= wlongstring+length)
 		Safefree(wstrings[j]);
+
 	Safefree(wlongstring);
+        Safefree(wstrings);
 
 	if (!result || !wMsgBuf) {
 	    FreeLibrary(dll);
@@ -553,14 +608,14 @@ CODE:
 	Safefree(MsgBuf);
 	LocalFree(wMsgBuf);
 
-	FreeLibrary(dll);
 	XSRETURN_YES;
     }
     else {
 	static const char *EVFILE[] = {"System", "Security", "Application"};
-	char *MsgBuf, *strings[16], *ptr, *tmpx;
+	char *MsgBuf, **strings, *ptr, *tmpx;
 	char msgfile[MAX_PATH], regPath[MAX_PATH];
-	DWORD i, id2;
+        char *message = NULL;
+	DWORD i, id2, maxinsert;
 	BOOL result;
 	LONG lResult;
 	unsigned short j;
@@ -582,15 +637,70 @@ CODE:
 	if (j >= (sizeof(EVFILE)/sizeof(EVFILE[0])))
 	    XSRETURN_NO;
 
+        /* Get the (list of) message file(s) for this entry */
+	i = sizeof(regPath);
+	lResult = RegQueryValueExA(hk, "EventMessageFile", 0, 0,
+				   (unsigned char *)regPath, &i);
+	if (lResult != ERROR_SUCCESS) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+	if (ExpandEnvironmentStringsA(regPath, msgfile, sizeof(msgfile)) == 0) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+        /* Try to retrieve message *without* expanding the inserts yet */
+        ptr = msgfile;
+        while (ptr && !message) {
+            char *semi = strchr(ptr, ';');
+            if (semi)
+                *semi++ = '\0';
+            dll = LoadLibraryExA(ptr, 0, LOAD_LIBRARY_AS_DATAFILE);
+            if (dll) {
+                FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                               FORMAT_MESSAGE_FROM_HMODULE    |
+                               FORMAT_MESSAGE_IGNORE_INSERTS,
+                               dll, id, 0, (LPSTR)&message, 0, NULL);
+                FreeLibrary(dll);
+            }
+            ptr = semi;
+        }
+	if (!message) {
+            RegCloseKey(hk);
+	    XSRETURN_NO;
+        }
+
+        /* Determine higest %n insert number */
+        maxinsert = numstrings;
+        ptr = message;
+        while ((percent=strchr(ptr, '%'))
+               && sscanf(percent, "%%%d", &id2) == 1)
+        {
+            if (id2 > maxinsert)
+                maxinsert = id2;
+            ptr = percent + 1;
+        }
+
+        New(0, strings, maxinsert, char*);
+
+        /* Allocate dummy strings for inserts not provided by caller */
+        for (j=numstrings; j<maxinsert; ++j) {
+            New(0, tmpx, 10, char);
+            sprintf(tmpx, "%%%d", j+1);
+            strings[j] = tmpx;
+        }
+
 	i = sizeof(regPath);	/* Fixed */
 
 	ptr = longstring;
-	for (j=0; j<=numstrings; j++) {
+	for (j=0; j<numstrings; j++) {
 	    strings[j] = ptr;
 	    ptr += strlen(ptr)+1;
 	    gotPercent = -1;
 	    while ((percent=strchr(strings[j], '%'))
-		   && sscanf(percent, "%%%%%d", &id2) ==1)
+		   && sscanf(percent, "%%%%%d", &id2) == 1)
 	    {
 		gotPercent++;
 		if (!dll) {		/* first time round - load dll */
@@ -617,77 +727,65 @@ CODE:
 			RegCloseKey(hk);
 			XSRETURN_NO;
 		    }
+                }
 
-		    if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER
-				       | FORMAT_MESSAGE_FROM_HMODULE
-				       | FORMAT_MESSAGE_ARGUMENT_ARRAY,
-				       dll, id2, 0, (LPSTR)&MsgBuf, 0,
-				       (va_list*)&strings[j]) == 0)
-		    {
-			FreeLibrary(dll);
-			RegCloseKey(hk);
-			XSRETURN_NO;
-		    }
+                if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER
+                                   | FORMAT_MESSAGE_FROM_HMODULE
+                                   | FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                                   dll, id2, 0, (LPSTR)&MsgBuf, 0,
+                                   (va_list*)&strings[j]) == 0)
+                {
+                    FreeLibrary(dll);
+                    RegCloseKey(hk);
+                    XSRETURN_NO;
+                }
 
-		    percentLen = 2;	/* for %% */
-		    do {
-			percentLen++;
-		    } while (id2/=10);	/* compute length of %%xxx string */
+                percentLen = 2;	/* for %% */
+                do {
+                    percentLen++;
+                } while (id2/=10);	/* compute length of %%xxx string */
 
-		    msgLen = strlen(MsgBuf);
-		    Newz(0, tmpx, strlen(strings[j])+msgLen-percentLen+1, char);
-		    strncpy(tmpx, strings[j], percent-strings[j]);
-		    strncat(tmpx, MsgBuf,
-			    msgLen - ((strcmp(MsgBuf+msgLen-2, "\r\n")==0) ? 2 : 0));
-		    strcat(tmpx, percent+percentLen);
-		    if (gotPercent)
-			Safefree(strings[j]);
-		    strings[j] = tmpx;
-		    LocalFree(MsgBuf);
-		}
+                msgLen = strlen(MsgBuf);
+                Newz(0, tmpx, strlen(strings[j])+msgLen-percentLen+1, char);
+                strncpy(tmpx, strings[j], percent-strings[j]);
+                strncat(tmpx, MsgBuf,
+                        msgLen - ((strcmp(MsgBuf+msgLen-2, "\r\n")==0) ? 2 : 0));
+                strcat(tmpx, percent+percentLen);
+                if (gotPercent)
+                    Safefree(strings[j]);
+                strings[j] = tmpx;
+                LocalFree(MsgBuf);
 	    }
 	}
 
+        RegCloseKey(hk);
 	if (dll)
 	    FreeLibrary(dll); /* in case it was used above */
-
-	i = sizeof(regPath);
-	lResult = RegQueryValueExA(hk, "EventMessageFile", 0, 0,
-				   (unsigned char *)regPath, &i);
-
-	RegCloseKey(hk);
-	if (lResult != ERROR_SUCCESS)
-	    XSRETURN_NO;
-
-	if (ExpandEnvironmentStringsA(regPath, msgfile, sizeof(msgfile)) == 0)
-	    XSRETURN_NO;
-
-	dll = LoadLibraryExA(msgfile, 0, LOAD_LIBRARY_AS_DATAFILE);
-	if (!dll)
-	    XSRETURN_NO;
 
 	/* XXX 'strings' argument may be broken on 64-bit
 	     * platforms since the documentation says 32-bit
 	     * values are required */
-	 result = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER
-                                 | FORMAT_MESSAGE_FROM_HMODULE
-                                 | FORMAT_MESSAGE_ARGUMENT_ARRAY,
-                                 dll, id, 0, (LPSTR)&MsgBuf, 0,
+	 result = FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+                                 FORMAT_MESSAGE_FROM_STRING |
+                                 FORMAT_MESSAGE_ARGUMENT_ARRAY,
+                                 message, 0, 0, (LPSTR)&MsgBuf, 0,
                                  (va_list*)strings) > 0;
 
-	for (j=0; j<=numstrings; j++)
+	LocalFree(message);
+
+	for (j=0; j<maxinsert; j++)
 	    if (strings[j] < longstring || strings[j] >= longstring+length)
 		Safefree(strings[j]);
 
+        Safefree(strings);
+
         if (!result || !MsgBuf) {
-	    FreeLibrary(dll);
 	    XSRETURN_NO;
 	}
 
 	SETPV(4, MsgBuf);
 	LocalFree(MsgBuf);
 
-	FreeLibrary(dll);
 	XSRETURN_YES;
     }
 }
@@ -810,7 +908,7 @@ OUTPUT:
 
 bool
 OpenBackupEventLog(hEventLog,lpszUNCServerName,lpszFileName)
-    U32       hEventLog = 0;
+    size_t       hEventLog = 0;
     char *    lpszUNCServerName
     char *    lpszFileName
 CODE:
@@ -836,7 +934,7 @@ CODE:
 	lpEvtLog->CurEntryNum   = 0;
 	lpEvtLog->CurEntry      = NULL;
 	lpEvtLog->Flags         = 0;
-	hEventLog = (U32)lpEvtLog;
+	hEventLog = (size_t)lpEvtLog;
 	RETVAL = TRUE;
     }
     else {
@@ -852,7 +950,7 @@ OUTPUT:
 
 bool
 OpenEventLog(hEventLog,lpszUNCServerName,lpszSourceName)
-    U32       hEventLog = 0;
+    size_t       hEventLog = 0;
     char *    lpszUNCServerName
     char *    lpszSourceName
 CODE:
@@ -878,7 +976,7 @@ CODE:
 	lpEvtLog->CurEntryNum   = 0;
 	lpEvtLog->CurEntry      = NULL;
 	lpEvtLog->Flags         = 0;
-	hEventLog = (U32)lpEvtLog;
+	hEventLog = (size_t)lpEvtLog;
 	RETVAL = TRUE;
     }
     else {

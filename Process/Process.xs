@@ -15,10 +15,36 @@ extern "C" {
 
 #include "../ppport.h"
 
+static BOOL
+Create(cProcess* &cP, char* szAppName, char* szCommLine, DWORD Inherit,
+       DWORD CreateFlags, char* szCurrDir)
+{
+    BOOL bRetVal;
+    void *env = NULL;
+#if PERL_VERSION > 5
+    env = PerlEnv_get_childenv();
+#endif
+    cP = NULL;
+    try {
+	cP = (cProcess*)new cProcess(szAppName,szCommLine,Inherit,CreateFlags,
+                                     env,szCurrDir);
+        bRetVal = cP->bRetVal;
+    }
+    catch (...) {
+        bRetVal = FALSE;
+    }
+#if PERL_VERSION > 5
+    PerlEnv_free_childenv(env);
+#endif
+    return bRetVal;
+}
 
 static BOOL
-Create(cProcess* &cP,char* szAppName,char* szCommLine,DWORD Inherit,DWORD CreateFlags,char* szCurrDir)
+CreateW(cProcess* &cP,WCHAR* szAppName,WCHAR* szCommLine,DWORD Inherit,DWORD CreateFlags,WCHAR* szCurrDir)
 {
+    // XXX environment will *not* be correctly inherited.
+    // Alas, we don't have corresponding Unicode accessor
+    // functions for the hosts environment.
     cP = NULL;
     try {
 	cP =(cProcess *) new cProcess(szAppName,szCommLine,Inherit,CreateFlags,szCurrDir);
@@ -30,11 +56,11 @@ Create(cProcess* &cP,char* szAppName,char* szCommLine,DWORD Inherit,DWORD Create
 }
 
 static BOOL
-CreateW(cProcess* &cP,WCHAR* szAppName,WCHAR* szCommLine,DWORD Inherit,DWORD CreateFlags,WCHAR* szCurrDir)
+Open_(cProcess * &cP, DWORD pid, DWORD Inherit)
 {
     cP = NULL;
     try {
-	cP =(cProcess *) new cProcess(szAppName,szCommLine,Inherit,CreateFlags,szCurrDir);
+	cP = (cProcess *) new cProcess(pid, Inherit);
     }
     catch (...) {
 	return(FALSE);
@@ -284,6 +310,18 @@ OUTPUT:
     RETVAL
 
 
+BOOL
+Open(cP,pid,inherit)
+    cProcess *cP = NULL;
+    DWORD pid
+    BOOL inherit
+CODE:
+    RETVAL = Open_(cP, pid, inherit);
+OUTPUT:
+    cP
+    RETVAL
+
+
 double
 constant(name)
     char *name
@@ -338,8 +376,8 @@ OUTPUT:
 BOOL
 GetProcessAffinityMask(cP,processAffinityMask,systemAffinityMask)
     cProcess *cP
-    DWORD processAffinityMask = NO_INIT
-    DWORD systemAffinityMask = NO_INIT
+    DWORD_PTR processAffinityMask = NO_INIT
+    DWORD_PTR systemAffinityMask = NO_INIT
 CODE:
     RETVAL = cP->GetProcessAffinityMask(&processAffinityMask,&systemAffinityMask);
 OUTPUT:

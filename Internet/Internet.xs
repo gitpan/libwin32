@@ -5,7 +5,7 @@
  * XS interface to the Win32 Internet Functions (WININET.DLL)
  * based on Registry.CPP written by Jesse Dougherty
  *
- * Version: 0.08 14 Feb 97
+ * Version: 0.082 4 Sep 2001
  *
  */
 
@@ -383,99 +383,85 @@ constant(char *name, int arg) {
 			}
 		if(strncmp(name, "INTERNET_", 9) == 0)
 			switch(name[9]) {
-			case 'C':
-				if(strEQ(name, "INTERNET_CONNECT_FLAG_PASSIVE"))
-					#ifdef INTERNET_CONNECT_FLAG_PASSIVE
-						return INTERNET_CONNECT_FLAG_PASSIVE;
+			case 'F':
+				if(strEQ(name, "INTERNET_FLAG_PASSIVE"))
+					#ifdef INTERNET_FLAG_PASSIVE
+						return INTERNET_FLAG_PASSIVE;
 					#else
 						goto not_there;
 					#endif
-				break;
-			case 'F':
 				if(strEQ(name, "INTERNET_FLAG_ASYNC"))
 					#ifdef INTERNET_FLAG_ASYNC
 						return INTERNET_FLAG_ASYNC;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_HYPERLINK"))
 					#ifdef INTERNET_FLAG_HYPERLINK
 						return INTERNET_FLAG_HYPERLINK;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_KEEP_CONNECTION"))
 					#ifdef INTERNET_FLAG_KEEP_CONNECTION
 						return INTERNET_FLAG_KEEP_CONNECTION;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_MAKE_PERSISTENT"))
 					#ifdef INTERNET_FLAG_MAKE_PERSISTENT
 						return INTERNET_FLAG_MAKE_PERSISTENT;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_NO_AUTH"))
 					#ifdef INTERNET_FLAG_NO_AUTH
 						return INTERNET_FLAG_NO_AUTH;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_NO_AUTO_REDIRECT"))
 					#ifdef INTERNET_FLAG_NO_AUTO_REDIRECT
 						return INTERNET_FLAG_NO_AUTO_REDIRECT;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_NO_CACHE_WRITE"))
 					#ifdef INTERNET_FLAG_NO_CACHE_WRITE
 						return INTERNET_FLAG_NO_CACHE_WRITE;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_NO_COOKIES"))
 					#ifdef INTERNET_FLAG_NO_COOKIES
 						return INTERNET_FLAG_NO_COOKIES;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_READ_PREFETCH"))
 					#ifdef INTERNET_FLAG_READ_PREFETCH
 						return INTERNET_FLAG_READ_PREFETCH;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_RELOAD"))
 					#ifdef INTERNET_FLAG_RELOAD
 						return INTERNET_FLAG_RELOAD;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_RESYNCHRONIZE"))
 					#ifdef INTERNET_FLAG_RESYNCHRONIZE
 						return INTERNET_FLAG_RESYNCHRONIZE;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_TRANSFER_ASCII"))
 					#ifdef INTERNET_FLAG_TRANSFER_ASCII
 						return INTERNET_FLAG_TRANSFER_ASCII;
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_FLAG_TRANSFER_BINARY"))
 					#ifdef INTERNET_FLAG_TRANSFER_BINARY
 						return INTERNET_FLAG_TRANSFER_BINARY;
@@ -490,7 +476,6 @@ constant(char *name, int arg) {
 					#else
 						goto not_there;
 					#endif
-				break;
 				if(strEQ(name, "INTERNET_INVALID_STATUS_CALLBACK"))
 					#ifdef INTERNET_INVALID_STATUS_CALLBACK
 						return (DWORD) INTERNET_INVALID_STATUS_CALLBACK;
@@ -667,7 +652,6 @@ constant(char *name, int arg) {
 					#else
 						goto not_there;
 					#endif
-				break;
 				if (strEQ(name, "INTERNET_STATUS_CONNECTING_TO_SERVER"))
 					#ifdef INTERNET_STATUS_CONNECTING_TO_SERVER
 						return INTERNET_STATUS_CONNECTING_TO_SERVER;
