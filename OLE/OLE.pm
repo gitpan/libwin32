@@ -6,7 +6,7 @@ use strict;
 use vars qw($VERSION @ISA @EXPORT @EXPORT_OK @EXPORT_FAIL $AUTOLOAD
 	    $CP $LCID $Warn $LastError);
 
-$VERSION = '0.08';
+$VERSION = '0.10';
 
 use Carp;
 use Exporter;
@@ -14,7 +14,9 @@ use DynaLoader;
 @ISA = qw(Exporter DynaLoader);
 
 @EXPORT = qw();
-@EXPORT_OK = qw(CP_ACP CP_OEMCP in valof with OVERLOAD);
+@EXPORT_OK = qw(CP_ACP CP_OEMCP in valof with OVERLOAD
+		DISPATCH_METHOD DISPATCH_PROPERTYGET
+		DISPATCH_PROPERTYPUT DISPATCH_PROPERTYPUTREF);
 @EXPORT_FAIL = qw(OVERLOAD);
 
 sub export_fail {
@@ -31,12 +33,20 @@ OVERLOAD
 }
 
 bootstrap Win32::OLE;
-sub END { Win32::OLE->Uninitialize(); }
 
 $Warn = 1;
 
 sub CP_ACP {0;}    # ANSI codepage
 sub CP_OEMCP {1;}  # OEM codepage
+
+sub DISPATCH_METHOD          {1;}
+sub DISPATCH_PROPERTYGET     {2;}
+sub DISPATCH_PROPERTYPUT     {4;}
+sub DISPATCH_PROPERTYPUTREF  {8;}
+
+sub COINIT_MULTITHREADED     {0;}  # Default
+sub COINIT_APARTMENTTHREADED {2;}  # Use single threaded apartment model
+sub COINIT_OLEINITIALIZE     {-1;} # Use OleInitialize instead of CoInitializeEx
 
 # The following class methods are pure XS code. They will delegate
 # to Dispatch when called as object methods.
@@ -46,13 +56,17 @@ sub CP_OEMCP {1;}  # OEM codepage
 # - GetObject(pathname)
 # - QueryObjectType(object)
 #
+# - Initialize(coinit)
+# - Uninitialize()
+# - SpinMessageLoop()
+#
 # The following method is pure XS (and not available as OLE method)
 # - DESTROY()
 #
 
 
-# CreateObject is defined here because it is documented in the
-# "Learning Perl on Win32 Systems" book. Please use Win32::OLE->new().
+# CreateObject is defined here only because it is documented in the
+# "Learning Perl on Win32 Systems" Gecko book. Please use Win32::OLE->new().
 sub CreateObject {
     if (ref($_[0]) && UNIVERSAL::isa($_[0],'Win32::OLE')) {
 	$AUTOLOAD = 'CreateObject';
@@ -87,6 +101,26 @@ sub Invoke {
     return $retval;
 }
 
+sub SetProperty {
+    my ($self, $method, @args) = @_;
+    my $retval;
+    my $wFlags = DISPATCH_PROPERTYPUT;
+    if (@args) {
+	# If the value is an object then it must be set by reference!
+	my $value = $args[scalar(@args)-1];
+	if (UNIVERSAL::isa($value, 'Win32::OLE')) {
+	    $wFlags = DISPATCH_PROPERTYPUTREF;
+	}
+	elsif (UNIVERSAL::isa($value,'Win32::OLE::Variant')) {
+	    my $type = $value->Type;
+	    # VT_DISPATCH and VT_UNKNOWN represent COM objects
+	    $wFlags = DISPATCH_PROPERTYPUTREF if $type == 9 || $type == 13;
+	}
+    }
+    $self->Dispatch([$wFlags, $method], $retval, @args);
+    return $retval;
+}
+
 sub AUTOLOAD {
     my $self = shift;
     my $retval;
@@ -103,10 +137,10 @@ sub AUTOLOAD {
 
 sub in {
     my @res;
-    require Win32::OLE::Enum;
     while (@_) {
 	my $this = shift;
 	if (UNIVERSAL::isa($this, 'Win32::OLE')) {
+	    require Win32::OLE::Enum;
 	    push @res, Win32::OLE::Enum->All($this);
 	}
 	elsif (ref($this) eq 'ARRAY') {
@@ -120,13 +154,13 @@ sub in {
 }
 
 sub valof {
-    require Win32::OLE::Variant;
     my $arg = shift;
     if (UNIVERSAL::isa($arg, 'Win32::OLE')) {
+	require Win32::OLE::Variant;
 	my ($class) = overload::StrVal($arg) =~ /^([^=]+)=/;
 	no strict 'refs';
-	local $Win32::OLE::Variant::CP = $ {$class."::CP"};
-	local $Win32::OLE::Variant::LCID = $ {$class."::LCID"};
+	local $Win32::OLE::Variant::CP = ${$class."::CP"};
+	local $Win32::OLE::Variant::LCID = ${$class."::LCID"};
 	use strict 'refs';
 	# VT_EMPTY variant for return code
 	my $variant = Win32::OLE::Variant->new(0,0);
@@ -153,12 +187,12 @@ package Win32::OLE::Tie;
 
 sub FETCH {
     my ($self,$key) = @_;
-    $self->Fetch($key, ~($^H & 0x200));
+    $self->Fetch($key, !($^H & 0x200));
 }
 
 sub STORE {
     my ($self,$key,$value) = @_;
-    $self->Store($key, $value, ~($^H & 0x200));
+    $self->Store($key, $value, !($^H & 0x200));
 }
 
 1;
@@ -241,6 +275,30 @@ The GetObject class method returns an OLE reference to the specified
 object. The object is specified by a pathname optionally followed by
 additional item subcomponent separated by exclamation marks '!'.
 
+=item Win32::OLE->Initialize(COINIT)
+
+The C<Initialize> class method can be used to specify an alternative
+apartment model for the Perl thread. It must be called before the
+first object is created. Valid values for COINIT are:
+
+  Win32::OLE::COINIT_APARTMENTTHREADED - single threaded
+  Win32::OLE::COINIT_MULTITHREADED     - the default
+  Win32::OLE::COINIT_OLEINITIALIZE     - single threaded, additional OLE stuff
+
+COINIT_OLEINITIALIZE is sometimes needed when an OLE object uses
+additional OLE compound document technologies not available from the
+normal COM subsystem (for example MAPI.Session seems to require it).
+Both COINIT_OLEINITIALIZE and COINIT_APARTMENTTHREADED create a hidden
+top level window and a message queue for the Perl process. This may
+create problems with other application, because Perl normally doesn't
+process its message queue. This means programs using synchronous
+communication between applications (such as DDE initiation), may hang
+until Perl makes another OLE method call/property access or terminates.
+This applies to InstallShield setups and many things started to shell
+associations. Please try to utilize the C<Win32::OLE-E<gt>SpinMessageLoop>
+and C<Win32::OLE-E<gt>Uninitialize> methods if you can not use the default
+COINIT_MULTITHREADED model.
+
 =item OBJECT->Invoke(METHOD,ARGS)
 
 The C<Invoke> object method is an alternate way to invoke OLE
@@ -249,7 +307,10 @@ function must be used if the METHOD name contains characters not valid
 in a Perl variable name (like foreign language characters). It can
 also be used to invoke the default method of an object even if the
 default method has not been given a name in the type library. In this
-case use <undef> or C<''> as the method name.
+case use <undef> or C<''> as the method name. To invoke an OLE objects
+native C<Invoke> method (if such a thing exists), please use:
+
+	$Object->Invoke('Invoke', @Args);
 
 =item Win32::OLE->LastError()
 
@@ -266,10 +327,46 @@ discard the string value):
 
 =item Win32::OLE->QueryObjectType(OBJECT)
 
-The QueryObjectType class method returns a list of the type library
+The C<QueryObjectType> class method returns a list of the type library
 name and the objects class name. In a scalar context it returns the
 class name only. It returns C<undef> when the type information is not
 available.
+
+=item OBJECT->SetProperty(NAME,ARGS,VALUE)
+
+The C<SetProperty> method allows to modify properties with arguments,
+which is not supported by the hash syntax. The hash form
+
+	$Object->{Property} = $Value;
+
+is equivalent to
+
+	$Object->SetProperty('Property', $Value);
+
+Arguments must be specified between the property name and the new value.
+It is not possible to use "named argument" syntax with this function
+because the new value must be the last argument to C<SetProperty>.
+
+This method hides any native OLE object method called C<SetProperty>.
+The native method will still be available through the C<Invoke> method:
+
+	$Object->Invoke('SetProperty', @Args);
+
+=item Win32::OLE->SpinMessageLoop
+
+This class method retrieves all pending messages from the message queue
+and dispatches them to their respective window procedures. Calling this
+method is only necessary when not using the COINIT_MULTITHREADED model.
+All OLE method calls and property accesses automatically process the
+message queue.
+
+=item Win32::OLE->Uninitialize
+
+The C<Uninitialize> class method uninitializes the OLE subsystem. It
+also destroys the hidden top level window created by OLE for single
+threaded apartments. All OLE objects will become invalid after this call!
+It is possible to call the C<Initialize> class method again with a different
+apartment model after shutting down OLE with C<Uninitialize>.
 
 =back
 
@@ -345,11 +442,17 @@ C<$OBJECT->{PROPERTYNAME} = $VALUE> on each trailing pair.
 The Win32::OLE objects can be overloaded to automatically convert to
 their values whenever they are used in a bool, numeric or string
 context. This is not enabled by default. You have to request it
-through the C<OVERLOAD> pseudotarget:
+through the C<OVERLOAD> pseudoexport:
 
 	use Win32::OLE qw(in valof with OVERLOAD);
 
-Please note that this is a global setting. If any module enables
+You can still get the original string representation of an object
+(C<Win32::OLE=0xDEADBEEF>), e.g. for debugging, by using the 
+C<overload::StrVal> method:
+
+	print overload::StrVal($object), "\n";
+
+Please note that C<OVERLOAD> is a global setting. If any module enables
 Win32::OLE overloading then it's active everywhere.
 
 =head2 Class Variables
@@ -661,40 +764,33 @@ the properties of the object.
 
 =item 1
 
-Currently there is no way to invoke any of the C<Dispatch>, C<DESTROY>, 
-C<GetProperty>, C<SetProperty> or C<With> object methods (except by
-calling Dispatch directly). This will be fixed in the next release
-by providing a documented replacement for the C<Dispatch> method. The
-interface has not been determined yet.
+To invoke a native OLE method with the same name as one of the
+Win32::OLE methods (C<Dispatch>, C<Invoke>, C<SetProperty>, C<DESTROY>,
+etc.), you have to use the C<Invoke> method:
 
-=item 2
+	$Object->Invoke('Dispatch', @AdditionalArgs);
 
-In the current release all the C<VT_*> and C<TKIND_*> names are not
-available as OLE method names.
-
-=item 3
-
-All function names defined by the Exporter module are currently unavailable
-as OLE method names. They are C<export>, C<export_to_level>, C<import>,
-C<_push_tags>, C<export_tags>, C<export_ok_tags>, C<export_fail> and
-C<require_version>.
-
-The same is true for all names defined by the Dynaloader: C<dl_load_flags>,
+The same is true for names exported by the Exporter or the Dynaloader
+modules, e.g.: C<export>, C<export_to_level>, C<import>,
+C<_push_tags>, C<export_tags>, C<export_ok_tags>, C<export_fail>,
+C<require_version>, C<dl_load_flags>,
 C<croak>, C<bootstrap>, C<dl_findfile>, C<dl_expandspec>, 
 C<dl_find_symbol_anywhere>, C<dl_load_file>, C<dl_find_symbol>,
 C<dl_undef_symbols>, C<dl_install_xsub> and C<dl_error>.
 
-=item 4
+=item 2
 
-The implementation is rather sensitive to error conditions, and will
-croak() on many different kinds of errors encountered at run time.  This
-could be construed as improper behavior for a generic module such as this.
-A well defined error API to report exceptional conditions will be offered
-in future, to allow the user to control which conditions are fatal.
+The class global variables C<$Win32::OLE::WARN> and C<$Win32::OLE::LCID>
+must currently be accessed directly. An API to manipulate these settings
+will be made available in the future.
 
 =back
 
-=back
+=head1 SEE ALSO
+
+The documentation for L<Win32::OLE::Const>, L<Win32::OLE::Enum>,
+L<Win32::OLE::NLS> and L<Win32::OLE::Variant> contains additional
+information about OLE support for Perl on Win32.
 
 =head1 AUTHORS
 
@@ -720,8 +816,6 @@ added support for named parameters, and other significant enhancements.
 
 =head1 VERSION
 
-Version 0.08	11 May 1998
+Version 0.10	9 September 1998
 
 =cut
-
-

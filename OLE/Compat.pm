@@ -4,8 +4,9 @@
 # This file is based on ../lib/OLE.pm from ActiveState build 315.
 
 # Compatibility notes:
-# - GetObject -> GetActiveObject
-# - keys %$collection -> Win32::OLE::Enum->All($collection)
+# - "GetObject" -> "GetActiveObject"
+# - "keys %$collection" -> "Win32::OLE::Enum->All($collection)"
+#                       or "in $Collection"
 # - "unnamed" default method retries
 
 ########################################################################
@@ -70,6 +71,9 @@ package OLE;
 ########################################################################
 use Win32::OLE qw(CP_ACP);
 
+# Use OleInitialize() instead of CoInitializeEx:
+Win32::OLE->Initialize(Win32::OLE::COINIT_OLEINITIALIZE);
+
 use strict;
 
 # Disable overload; unfortunately "no overload" doesn't do it :-(
@@ -105,6 +109,7 @@ sub AUTOLOAD {
     Carp::croak("Cannot autoload class method \"$AUTOLOAD\"") 
       unless ref($self) && UNIVERSAL::isa($self,'OLE');
 
+    local $^H = 0; # !hack alert!
     unless (defined $self->Dispatch($AUTOLOAD, $retval, @_)) {
 	# Retry default method
 	$self->Dispatch(undef, $retval, $AUTOLOAD, @_);

@@ -22,33 +22,54 @@
  *
  */
 
+#ifdef XS_VERSION
+#   define MY_VERSION "Win32::OLE(" XS_VERSION ")"
+#else
+#   define MY_VERSION "Win32::OLE(?.??)"
+#endif
+
 #include <math.h>	/* this hack gets around VC-5.0 brainmelt */
+#define _WIN32_DCOM
 #include <windows.h>
 
-/* necessary for VC++ 5.0? */
-#define _WIN32_DCOM
-#include <objbase.h>
-
 #ifdef _DEBUG
-    #include <crtdbg.h>
-    #define DEBUGBREAK _CrtDbgBreak()
+#   include <crtdbg.h>
+#   define DEBUGBREAK _CrtDbgBreak()
 #else
-    #define DEBUGBREAK
+#   define DEBUGBREAK
 #endif
 
 #if defined(__cplusplus)
 extern "C" {
 #endif
 
+#define MIN_PERL_DEFINE
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSub.h"
 #include "patchlevel.h"
 
+#if (PATCHLEVEL < 4) || ((PATCHLEVEL == 4) && (SUBVERSION < 1))
+#   error Win32::OLE module requires Perl 5.004_01 or later
+#endif
+
+#if (PATCHLEVEL < 5) && !defined(PL_dowarn)
+#   define PL_hints	hints
+#   define PL_dowarn	dowarn
+#   define PL_modglobal	modglobal
+#   define PL_sv_undef	sv_undef
+#   define PL_sv_yes    sv_yes
+#   define PL_sv_no     sv_no
+#endif
+
+#ifndef CPERLarg_
+#   define CPERLarg_
+#endif
+
 #if !defined(_DEBUG)
-#    define DBG(a)
+#   define DBG(a)
 #else
-#    define DBG(a)  MyDebug a
+#   define DBG(a)  MyDebug a
 void
 MyDebug(const char *pat, ...)
 {
@@ -92,17 +113,68 @@ static const int LASTERR_LEN = sizeof(LASTERR_NAME)-1;
 static char TIE_NAME[] = "Tie";
 static const int TIE_LEN = sizeof(TIE_NAME)-1;
 
+typedef HRESULT (STDAPICALLTYPE FNCOINITIALIZEEX)(LPVOID, DWORD);
+typedef void (STDAPICALLTYPE FNCOUNINITIALIZE)(void);
 typedef HRESULT (STDAPICALLTYPE FNCOCREATEINSTANCEEX)
     (REFCLSID, IUnknown*, DWORD, COSERVERINFO*, DWORD, MULTI_QI*);
 
-/* common object header */
 typedef struct _tagOBJECTHEADER OBJECTHEADER;
+
+/* per interpreter variables */
+typedef struct
+{
+    CRITICAL_SECTION CriticalSection;
+    OBJECTHEADER *pObj;
+    BOOL bInitialized;
+
+    /* DCOM function addresses are resolved dynamically */
+    HINSTANCE hOLE32;
+    FNCOINITIALIZEEX     *pfnCoInitializeEx;
+    FNCOUNINITIALIZE     *pfnCoUninitialize;
+    FNCOCREATEINSTANCEEX *pfnCoCreateInstanceEx;
+
+}   PERINTERP;
+
+#if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+#   if (PATCHLEVEL == 4) && (SUBVERSION < 68)
+#       define dPERINTERP                                                 \
+           SV *interp = perl_get_sv(MY_VERSION, FALSE);                   \
+           if (interp == NULL || !SvIOK(interp))                          \
+               warn(MY_VERSION ": Per-interpreter data not initialized"); \
+           PERINTERP *pInterp = (PERINTERP*)SvIV(interp)
+#   else
+#	define dPERINTERP                                                 \
+           SV **pinterp = hv_fetch(PL_modglobal, MY_VERSION,              \
+                                   sizeof(MY_VERSION)-1, FALSE);          \
+           if (pinterp == NULL || *pinterp == NULL || !SvIOK(*pinterp))   \
+               warn(MY_VERSION ": Per-interpreter data not initialized"); \
+	   PERINTERP *pInterp = (PERINTERP*)SvIV(*pinterp)
+#   endif
+#   define INTERP pInterp
+#else
+static PERINTERP Interp;
+#   define dPERINTERP extern int errno
+#   define INTERP (&Interp)
+#endif
+
+#define g_pObj            (INTERP->pObj)
+#define g_bInitialized    (INTERP->bInitialized)
+#define g_CriticalSection (INTERP->CriticalSection)
+
+#define g_hOLE32                (INTERP->hOLE32)
+#define g_pfnCoInitializeEx     (INTERP->pfnCoInitializeEx)
+#define g_pfnCoUninitialize     (INTERP->pfnCoUninitialize)
+#define g_pfnCoCreateInstanceEx (INTERP->pfnCoCreateInstanceEx)
+
+/* common object header */
 typedef struct _tagOBJECTHEADER
 {
     long lMagic;
     OBJECTHEADER *pNext;
     OBJECTHEADER *pPrevious;
-
+#if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+    PERINTERP    *pInterp;
+#endif
 }   OBJECTHEADER;
 
 /* Win32::OLE object */
@@ -142,12 +214,12 @@ typedef struct
     VARIANT variant;
     VARIANT byref;
 
+    HV      *stash;    /* for VT_DISPATCH and VT_UNKNOWN Variants */
+
 }   WINOLEVARIANTOBJECT;
 
-/* global variables */
-static BOOL g_bInitialized = FALSE;
-static CRITICAL_SECTION g_CriticalSection;
-static OBJECTHEADER *g_pObj = NULL;
+/* forward declarations */
+HRESULT SetSVFromVariant(VARIANTARG *pVariant, SV* sv, HV *stash);
 
 /* The following function from IO.xs is in the core starting with 5.004_63 */
 #if (PATCHLEVEL == 4) && (SUBVERSION < 63)
@@ -157,13 +229,13 @@ newCONSTSUB(HV *stash, char *name, SV *sv)
 #ifdef dTHR
     dTHR;
 #endif
-    U32 oldhints = hints;
+    U32 oldhints = PL_hints;
     HV *old_cop_stash = curcop->cop_stash;
     HV *old_curstash = curstash;
     line_t oldline = curcop->cop_line;
     curcop->cop_line = copline;
 
-    hints &= ~HINT_BLOCK_SCOPE;
+    PL_hints &= ~HINT_BLOCK_SCOPE;
     if(stash)
 	curstash = curcop->cop_stash = stash;
 
@@ -174,15 +246,142 @@ newCONSTSUB(HV *stash, char *name, SV *sv)
 	newSTATEOP(0, Nullch, newSVOP(OP_CONST, 0, sv))
     );
 
-    hints = oldhints;
+    PL_hints = oldhints;
     curcop->cop_stash = old_cop_stash;
     curstash = old_curstash;
     curcop->cop_line = oldline;
 }
 #endif
 
-/* forward declarations */
-HRESULT SetSVFromVariant(VARIANTARG *pVariant, SV* sv, HV *stash);
+BOOL
+IsLocalMachine(char *pszMachine)
+{
+    char szComputerName[MAX_COMPUTERNAME_LENGTH+1];
+    DWORD dwSize = sizeof(szComputerName);
+    char *pszName = pszMachine;
+
+    while (*pszName == '\\')
+	++pszName;
+
+    if (*pszName == '\0')
+	return TRUE;
+
+    /* Check against local computer name (from registry) */
+    if (GetComputerName(szComputerName, &dwSize)
+	&& stricmp(pszName, szComputerName) == 0)
+	return TRUE;
+
+    /* gethostname(), gethostbyname() and inet_addr() all call proxy functions
+     * in the Perl socket layer wrapper in win32sck.c. Therefore calling
+     * WSAStartup() here is not necessary.
+     */
+
+    /* Determine main host name of local machine */
+    char szBuffer[200];
+    if (gethostname(szBuffer, sizeof(szBuffer)) != 0)
+	return FALSE;
+
+    /* Copy list of addresses for local machine */
+    struct hostent *pHostEnt = gethostbyname(szBuffer);
+    if (pHostEnt == NULL)
+	return FALSE;
+
+    if (pHostEnt->h_addrtype != PF_INET || pHostEnt->h_length != 4) {
+	warn(MY_VERSION ": IsLocalMachine() gethostbyname failure");
+	return FALSE;
+    }
+
+    int index;
+    int count = 0;
+    char *pLocal;
+    while (pHostEnt->h_addr_list[count] != NULL)
+	++count;
+
+    New(0, pLocal, 4*count, char);
+    for (index = 0 ; index < count ; ++index)
+	memcpy(pLocal+4*index, pHostEnt->h_addr_list[index], 4);
+
+    /* Determine addresses of remote machine */
+    unsigned long ulRemoteAddr;
+    char *pRemote[2] = {NULL, NULL};
+    char **ppRemote = &pRemote[0];
+
+    if (isdigit(*pszMachine)) {
+	/* Convert numeric dotted address */
+	ulRemoteAddr = inet_addr(pszMachine);
+	if (ulRemoteAddr != INADDR_NONE)
+	    pRemote[0] = (char*)&ulRemoteAddr;
+    }
+    else {
+	/* Lookup addresses for remote host name */
+	pHostEnt = gethostbyname(pszMachine);
+	if (pHostEnt != NULL)
+	    if (pHostEnt->h_addrtype == PF_INET && pHostEnt->h_length == 4)
+		ppRemote = pHostEnt->h_addr_list;
+    }
+
+    /* Compare list of addresses of remote machine against local addresses */
+    while (*ppRemote != NULL) {
+	for (index = 0 ; index < count ; ++index)
+	    if (memcmp(pLocal+4*index, *ppRemote, 4) == 0) {
+		Safefree(pLocal);
+		return TRUE;
+	    }
+	++ppRemote;
+    }
+
+    Safefree(pLocal);
+    return FALSE;
+
+}   /* IsLocalMachine */
+
+HRESULT
+CLSIDFromRemoteRegistry(char *pszHost, char *pszProgID, CLSID *pCLSID)
+{
+    HKEY hKeyLocalMachine;
+    HKEY hKeyProgID;
+    LONG err;
+    HRESULT res = S_OK;
+    STRLEN len;
+
+    err = RegConnectRegistry(pszHost, HKEY_LOCAL_MACHINE, &hKeyLocalMachine);
+    if (err != ERROR_SUCCESS)
+	return HRESULT_FROM_WIN32(err);
+
+    SV *subkey = sv_2mortal(newSVpv("SOFTWARE\\Classes\\", 0));
+    sv_catpv(subkey, pszProgID);
+    sv_catpv(subkey, "\\CLSID");
+
+    err = RegOpenKeyEx(hKeyLocalMachine, SvPV(subkey, len), 0, KEY_READ,
+		       &hKeyProgID);
+    if (err != ERROR_SUCCESS)
+	res = HRESULT_FROM_WIN32(err);
+    else {
+	DWORD dwType;
+	char szCLSID[100];
+	DWORD dwLength = sizeof(szCLSID);
+
+	err = RegQueryValueEx(hKeyProgID, "", NULL, &dwType,
+			      (unsigned char*)&szCLSID, &dwLength);
+	if (err != ERROR_SUCCESS)
+	    res = HRESULT_FROM_WIN32(err);
+	else if (dwType == REG_SZ) {
+	    OLECHAR wszCLSID[sizeof(szCLSID)];
+
+	    MultiByteToWideChar(CP_ACP, 0, szCLSID, -1,
+				wszCLSID, sizeof(szCLSID));
+	    res = CLSIDFromString(wszCLSID, pCLSID);
+	}
+	else /* XXX maybe there is a more appropriate error code? */
+	    res = HRESULT_FROM_WIN32(ERROR_CANTREAD);
+
+	RegCloseKey(hKeyProgID);
+    }
+
+    RegCloseKey(hKeyLocalMachine);
+    return res;
+
+}   /* CLSIDFromRemoteRegistry */
 
 /* The following strategy is used to avoid the limitations of hardcoded
  * buffer sizes: Conversion between wide char and multibyte strings
@@ -219,7 +418,7 @@ GetMultiByte(OLECHAR *wide, char *psz, int len, UINT cp)
 
     count = WideCharToMultiByte(cp, 0, wide, -1, NULL, 0, NULL, NULL);
     if (count == 0) { /* should never happen */
-	warn("Win32::OLE: GetMultiByte() failure: %lu", GetLastError());
+	warn(MY_VERSION ": GetMultiByte() failure: %lu", GetLastError());
 	DEBUGBREAK;
 	if (psz == NULL)
 	    New(0, psz, 1, char);
@@ -230,7 +429,8 @@ GetMultiByte(OLECHAR *wide, char *psz, int len, UINT cp)
     Newz(0, psz, count, char);
     WideCharToMultiByte(cp, 0, wide, -1, psz, count, NULL, NULL);
     return psz;
-}
+
+}   /* GetMultiByte */
 
 SV *
 sv_setwide(SV *sv, OLECHAR *wide, UINT cp)
@@ -269,7 +469,7 @@ GetWideChar(char *psz, OLECHAR *wide, int len, UINT cp)
 
     count = MultiByteToWideChar(cp, 0, psz, -1, NULL, 0);
     if (count == 0) {
-	warn("Win32::OLE: GetWideChar() failure: %lu", GetLastError());
+	warn(MY_VERSION ": GetWideChar() failure: %lu", GetLastError());
 	DEBUGBREAK;
 	if (wide == NULL)
 	    New(0, wide, 1, OLECHAR);
@@ -280,7 +480,8 @@ GetWideChar(char *psz, OLECHAR *wide, int len, UINT cp)
     Newz(0, wide, count, OLECHAR);
     MultiByteToWideChar(cp, 0, psz, -1, wide, count);
     return wide;
-}
+
+}   /* GetWideChar */
 
 IV
 QueryPkgVar(HV *stash, char *var, STRLEN len, IV def)
@@ -299,13 +500,15 @@ QueryPkgVar(HV *stash, char *var, STRLEN len, IV def)
 void
 SetLastOleError(HV *stash, HRESULT res=S_OK, char *pszMsg=NULL)
 {
+    STRLEN len;
+
     /* Find $Win32::OLE::LastError */
     SV *sv = sv_2mortal(newSVpv(HvNAME(stash), 0));
     sv_catpvn(sv, "::", 2);
     sv_catpvn(sv, LASTERR_NAME, LASTERR_LEN);
-    SV *lasterr = perl_get_sv(SvPV(sv, na), TRUE);
+    SV *lasterr = perl_get_sv(SvPV(sv, len), TRUE);
     if (lasterr == NULL) {
-	warn("Win32::OLE: SetLastOleError: couldnot create package variable %s",
+	warn(MY_VERSION ": SetLastOleError: couldnot create variable %s",
 	     LASTERR_NAME);
 	DEBUGBREAK;
 	return;
@@ -325,6 +528,7 @@ ReportOleError(HV *stash, HRESULT res, EXCEPINFO *pExcep=NULL, SV *svAdd=NULL)
 
     IV OleWarn = QueryPkgVar(stash, WARN_NAME, WARN_LEN, 0);
     SV *sv = sv_2mortal(newSVpv("",0));
+    STRLEN len;
 
     /* start with exception info */
     if (pExcep != NULL && (pExcep->bstrSource != NULL ||
@@ -357,7 +561,7 @@ ReportOleError(HV *stash, HRESULT res, EXCEPINFO *pExcep=NULL, SV *svAdd=NULL)
     }
 
     /* always include OLE error code */
-    sv_catpvf(sv, "OLE error 0x%08x", res);
+    sv_catpvf(sv, MY_VERSION " error 0x%08x", res);
 
     /* try to append ': "error text"' from message catalog */
     char *pszMsgText;
@@ -394,7 +598,7 @@ ReportOleError(HV *stash, HRESULT res, EXCEPINFO *pExcep=NULL, SV *svAdd=NULL)
 
     /* try to keep linelength of description below 80 chars. */
     char *pLastBlank = NULL;
-    char *pch = SvPV(sv, na);
+    char *pch = SvPV(sv, len);
     int  cch;
 
     for (cch = 0 ; *pch ; ++pch, ++cch) {
@@ -412,9 +616,9 @@ ReportOleError(HV *stash, HRESULT res, EXCEPINFO *pExcep=NULL, SV *svAdd=NULL)
 	}
     }
 
-    SetLastOleError(stash, res, SvPV(sv, na));
-
-    if (OleWarn > 1 || (OleWarn == 1 && dowarn)) {
+    SetLastOleError(stash, res, SvPV(sv, len));
+    
+    if (OleWarn > 1 || (OleWarn == 1 && PL_dowarn)) {
 	PUSHMARK(sp) ;
 	XPUSHs(sv);
 	PUTBACK;
@@ -452,10 +656,17 @@ CheckDestroyFunction(SV *sv, char *szMethod)
 void
 AddToObjectChain(OBJECTHEADER *pHeader, long lMagic)
 {
+    dPERINTERP;
+
     EnterCriticalSection(&g_CriticalSection);
     pHeader->lMagic = lMagic;
     pHeader->pPrevious = NULL;
     pHeader->pNext = g_pObj;
+
+#if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+    pHeader->pInterp = INTERP;
+#endif
+
     if (g_pObj)
 	g_pObj->pPrevious = pHeader;
     g_pObj = pHeader;
@@ -467,6 +678,10 @@ RemoveFromObjectChain(OBJECTHEADER *pHeader)
 {
     if (pHeader == NULL)
 	return;
+
+#if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+    PERINTERP *pInterp = pHeader->pInterp;
+#endif
 
     EnterCriticalSection(&g_CriticalSection);
     if (pHeader->pPrevious == NULL) {
@@ -489,9 +704,9 @@ CreatePerlObject(HV *stash, IDispatch *pDispatch, SV *destroy)
     /* returns a mortal reference to a new Perl OLE object */
 
     if (pDispatch == NULL) {
-	warn("Win32::OLE: CreatePerlObject() No IDispatch interface");
+	warn(MY_VERSION ": CreatePerlObject() No IDispatch interface");
 	DEBUGBREAK;
-	return &sv_undef;
+	return &PL_sv_undef;
     }
 
     WINOLEOBJECT *pObj;
@@ -500,9 +715,10 @@ CreatePerlObject(HV *stash, IDispatch *pDispatch, SV *destroy)
     SV *sv;
     GV **gv = (GV **) hv_fetch(stash, TIE_NAME, TIE_LEN, FALSE);
     char *szTie = szWINOLETIE;
+    STRLEN len;
 
     if (gv != NULL && (sv = GvSV(*gv)) != NULL && SvPOK(sv))
-	szTie = SvPV(sv, na);
+	szTie = SvPV(sv, len);
 
     New(0, pObj, 1, WINOLEOBJECT);
     pObj->pDispatch = pDispatch;
@@ -521,7 +737,7 @@ CreatePerlObject(HV *stash, IDispatch *pDispatch, SV *destroy)
 
     AddToObjectChain(&pObj->header, WINOLE_MAGIC);
 
-    DBG(("CreatePerlObject = |%lx| Class = %s Tie = %s\n", pObj, 
+    DBG(("CreatePerlObject = |%lx| Class = %s Tie = %s\n", pObj,
 	 HvNAME(stash), szTie));
 
     hv_store(hvinner, PERL_OLE_ID, PERL_OLE_IDLEN, newSViv((long)pObj), 0);
@@ -602,6 +818,8 @@ ReleasePerlObject(WINOLEOBJECT *pObj)
 
     DBG(("\n"));
 
+    CoFreeUnusedLibraries();
+
 }   /* ReleasePerlObject */
 
 WINOLEOBJECT *
@@ -609,7 +827,15 @@ GetOleObject(SV *sv, BOOL bDESTROY=FALSE)
 {
     if (sv_isobject(sv) && SvTYPE(SvRV(sv)) == SVt_PVHV) {
 	SV **psv = hv_fetch((HV*)SvRV(sv), PERL_OLE_ID, PERL_OLE_IDLEN, 0);
+
+#if (PATCHLEVEL > 4) || ((PATCHLEVEL == 4) && (SUBVERSION > 4))
+	if (SvGMAGICAL(*psv))
+	    mg_get(*psv);
+
+	if (psv != NULL && SvIOK(*psv)) {
+#else
 	if (psv != NULL) {
+#endif
 	    WINOLEOBJECT *pObj = (WINOLEOBJECT*)SvIV(*psv);
 
 	    DBG(("GetOleObject = |%lx|\n", pObj));
@@ -618,7 +844,7 @@ GetOleObject(SV *sv, BOOL bDESTROY=FALSE)
 		    return pObj;
 	}
     }
-    warn("Win32::OLE: GetOleObject() Not a %s object", szWINOLE);
+    warn(MY_VERSION ": GetOleObject() Not a %s object", szWINOLE);
     DEBUGBREAK;
     return (WINOLEOBJECT*)NULL;
 }
@@ -633,7 +859,7 @@ GetOleEnumObject(SV *sv, BOOL bDESTROY=FALSE)
 	    if (pEnumObj->pEnum != NULL || bDESTROY)
 		return pEnumObj;
     }
-    warn("Win32::OLE: GetOleEnumObject() Not a %s object", szWINOLEENUM);
+    warn(MY_VERSION ": GetOleEnumObject() Not a %s object", szWINOLEENUM);
     DEBUGBREAK;
     return (WINOLEENUMOBJECT*)NULL;
 }
@@ -647,7 +873,7 @@ GetOleVariantObject(SV *sv)
 	if (pVarObj != NULL && pVarObj->header.lMagic == WINOLEVARIANT_MAGIC)
 	    return pVarObj;
     }
-    warn("Win32::OLE: GetOleVariantObject() Not a %s object", szWINOLEVARIANT);
+    warn(MY_VERSION ": GetOleVariantObject() Not a %s object", szWINOLEVARIANT);
     DEBUGBREAK;
     return (WINOLEVARIANTOBJECT*)NULL;
 }
@@ -713,7 +939,7 @@ FetchTypeInfo(WINOLEOBJECT *pObj)
     }
 
     if (CheckOleError(stash, res)) {
-	warn("Win32::OLE: FetchTypeInfo() GetTypeInfoCount failed");
+	warn(MY_VERSION ": FetchTypeInfo() GetTypeInfoCount failed");
 	DEBUGBREAK;
 	return;
     }
@@ -794,7 +1020,7 @@ NextPropertyName(WINOLEOBJECT *pObj)
     BSTR bstr;
 
     if (pObj->pTypeInfo == NULL)
-	return &sv_undef;
+	return &PL_sv_undef;
 
     HV *stash = SvSTASH(pObj->self);
     UINT cp = QueryPkgVar(stash, CP_NAME, CP_LEN, cpDefault);
@@ -854,7 +1080,7 @@ NextPropertyName(WINOLEOBJECT *pObj)
 	    return sv;
 	}
     }
-    return &sv_undef;
+    return &PL_sv_undef;
 
 }   /* NextPropertyName */
 
@@ -899,7 +1125,7 @@ SV *
 NextEnumElement(IEnumVARIANT *pEnum, HV *stash)
 {
     HRESULT res = S_OK;
-    SV *sv = &sv_undef;
+    SV *sv = &PL_sv_undef;
     VARIANT variant;
 
     VariantInit(&variant);
@@ -910,7 +1136,7 @@ NextEnumElement(IEnumVARIANT *pEnum, HV *stash)
     VariantClear(&variant);
     if (FAILED(res)) {
         SvREFCNT_dec(sv);
-	sv = &sv_undef;
+	sv = &PL_sv_undef;
 	ReportOleError(stash, res);
     }
     return sv;
@@ -1094,8 +1320,6 @@ SetVariantFromSV(SV* sv, VARIANT *pVariant, UINT cp)
 
 }   /* SetVariantFromSV */
 
-
-
 #define SETiVRETURN(x,f)					\
 		    if (x->vt&VT_BYREF) {			\
 			sv_setiv(sv, (long)*V_##f##REF(x));	\
@@ -1114,10 +1338,10 @@ HRESULT
 SetSVFromVariant(VARIANTARG *pVariant, SV* sv, HV *stash)
 {
     HRESULT res = S_OK;
-    sv_setsv(sv, &sv_undef);
+    sv_setsv(sv, &PL_sv_undef);
 
     if (V_ISARRAY(pVariant)) {
-	SAFEARRAY *psa = V_ISBYREF(pVariant) ? *V_ARRAYREF(pVariant) 
+	SAFEARRAY *psa = V_ISBYREF(pVariant) ? *V_ARRAYREF(pVariant)
 	                                     : V_ARRAY(pVariant);
 	AV **pav;
 	IV index;
@@ -1327,24 +1551,45 @@ SpinMessageLoop(void)
 	TranslateMessage(&msg);
 	DispatchMessage(&msg);
     }
-}
+
+}   /* SpinMessageLoop */
 
 void
-Initialize(void)
+Initialize(DWORD dwCoInit=COINIT_MULTITHREADED)
 {
+    dPERINTERP;
+
     DBG(("Initialize\n"));
     EnterCriticalSection(&g_CriticalSection);
-    if (!g_bInitialized) {
-	DBG(("OleInitialize\n"));
-	OleInitialize(NULL);
+
+    if (!g_bInitialized)
+    {
+	DBG(("(Co|Ole)Initialize(Ex)?\n"));
+	if (dwCoInit == -1) {
+	    OleInitialize(NULL);
+	    g_pfnCoUninitialize = &OleUninitialize;
+	}
+	else {
+	    if (g_pfnCoInitializeEx == NULL)
+		CoInitialize(NULL);
+	    else
+		g_pfnCoInitializeEx(NULL, dwCoInit);
+	    g_pfnCoUninitialize = &CoUninitialize;
+	}
+
 	g_bInitialized = TRUE;
     }
+
     LeaveCriticalSection(&g_CriticalSection);
-}
+
+}   /* Initialize */
 
 void
-Uninitialize(void)
+Uninitialize(PERINTERP *pInterp, int magic=0)
 {
+    /* This function is called during Perl interpreter cleanup after all objects
+     * have already been destroyed. Do NOT access Perl data structures! */
+
     DBG(("Uninitialize\n"));
     EnterCriticalSection(&g_CriticalSection);
     if (g_bInitialized) {
@@ -1383,37 +1628,79 @@ Uninitialize(void)
 	}
 
 	SpinMessageLoop();
-	DBG(("OleUninitialize\n"));
-	OleUninitialize();
-
+	DBG(("CoUninitialize\n"));
+	g_pfnCoUninitialize();
 	g_bInitialized = FALSE;
     }
     LeaveCriticalSection(&g_CriticalSection);
-}
 
-BOOL APIENTRY
-#ifdef __BORLANDC__
-DllEntryPoint
-#else
-DllMain
-#endif
-(HANDLE hModule, DWORD fdwReason, LPVOID lpvReserved)
-{
-    switch (fdwReason) {
-    case DLL_PROCESS_ATTACH:
-	DBG(("Win32::OLE DLL_PROCESS_ATTACH\n"));
-	InitializeCriticalSection(&g_CriticalSection);
-	break;
-
-    case DLL_PROCESS_DETACH:
+    if (magic == WINOLE_MAGIC) {
+    // Yes, we DO leak the critical section and memory block for earlier
+    // versions of Perl (because they might still be referenced during the
+    // global object destruction phase).
+#if (PATCHLEVEL > 4) || (SUBVERSION >= 68)
 	DeleteCriticalSection(&g_CriticalSection);
-	DBG(("Win32::OLE DLL_PROCESS_DETACH\n"));
-	break;
+	if (g_hOLE32 != NULL)
+	    FreeLibrary(g_hOLE32);
+#   if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+	Safefree(pInterp);
+#   endif
+#endif
+	DBG(("Interpreter exit\n"));
     }
 
-    return TRUE;
+}   /* Uninitialize */
 
-}   /* DllMain/DllEntryPoint */
+static void
+AtExit(CPERLarg_ void *pVoid)
+{
+    Uninitialize((PERINTERP*)pVoid, WINOLE_MAGIC);
+    DBG(("AtExit done\n"));
+
+}   /* AtExit */
+
+void
+Bootstrap(void)
+{
+#if defined(MULTIPLICITY) || defined(PERL_OBJECT)
+    PERINTERP *pInterp;
+    New(0, pInterp, 1, PERINTERP);
+
+#   if (PATCHLEVEL == 4) && (SUBVERSION < 68)
+    SV *sv = perl_get_sv(MY_VERSION, TRUE);
+#   else
+    SV *sv = *hv_fetch(PL_modglobal, MY_VERSION, sizeof(MY_VERSION)-1, TRUE);
+#   endif
+
+    if (SvOK(sv))
+	warn(MY_VERSION ": Per-interpreter data already set");
+
+    sv_setiv(sv, (IV)pInterp);
+#endif
+
+    g_pObj = NULL;
+    g_bInitialized = FALSE;
+    InitializeCriticalSection(&g_CriticalSection);
+
+    g_hOLE32 = LoadLibrary("OLE32");
+    g_pfnCoInitializeEx = NULL;
+    g_pfnCoCreateInstanceEx = NULL;
+    if (g_hOLE32 != NULL) {
+	g_pfnCoInitializeEx = (FNCOINITIALIZEEX*)
+	    GetProcAddress(g_hOLE32, "CoInitializeEx");
+	g_pfnCoCreateInstanceEx = (FNCOCREATEINSTANCEEX*)
+	    GetProcAddress(g_hOLE32, "CoCreateInstanceEx");
+    }
+
+#if (PATCHLEVEL == 4) && (SUBVERSION < 68)
+    SV *cmd = sv_2mortal(newSVpv("",0));
+    sv_setpvf(cmd, "END { %s->Uninitialize(%d); }", szWINOLE, WINOLE_MAGIC );
+    perl_eval_sv(cmd, TRUE);
+#else
+    perl_atexit(AtExit, INTERP);
+#endif
+
+}   /* Bootstrap */
 
 BOOL
 CallObjectMethod(SV **mark, I32 ax, I32 items, char *pszMethod)
@@ -1466,8 +1753,9 @@ GetStash(SV *sv)
     else if (SvPOK(sv))
 	return gv_stashsv(sv, TRUE);
     else
-	return (HV *)&sv_undef;
-}
+	return (HV *)&PL_sv_undef;
+
+}   /* GetStash */
 
 #if defined(__cplusplus)
 }
@@ -1478,6 +1766,9 @@ GetStash(SV *sv)
 MODULE = Win32::OLE		PACKAGE = Win32::OLE
 
 PROTOTYPES: DISABLE
+
+BOOT:
+    Bootstrap();
 
 void
 Initialize(...)
@@ -1493,14 +1784,32 @@ PPCODE:
 
     DBG(("Win32::OLE->%s()\n", paszMethod[ix]));
 
-    if (items != 1)
-	warn("Usage: Win32::OLE->%s()", paszMethod[ix]);
-
     switch (ix)
     {
-    case 0: Initialize();      break;
-    case 1: Uninitialize();    break;
-    case 2: SpinMessageLoop(); break;
+    case 0:
+    {
+	DWORD dwCoInit = COINIT_MULTITHREADED;
+
+	if (items > 1 && SvOK(ST(1)))
+	    dwCoInit = SvIV(ST(1));
+
+	Initialize(dwCoInit);
+	break;
+    }
+    case 1:
+    {
+	int magic = 0;
+	dPERINTERP;
+
+	if (items > 1 && SvOK(ST(1)))
+	    magic = SvIV(ST(1));
+
+	Uninitialize(INTERP, magic);
+	break;
+    }
+    case 2:
+	SpinMessageLoop();
+	break;
     }
 
     XSRETURN_UNDEF;
@@ -1511,15 +1820,11 @@ new(...)
 PPCODE:
 {
     CLSID clsid;
+    IDispatch *pDispatch = NULL;
     OLECHAR Buffer[OLE_BUF_SIZ];
     OLECHAR *pBuffer;
-    unsigned int length;
-    char *buffer;
-    HKEY handle;
     HRESULT res;
-    FNCOCREATEINSTANCEEX *pfnCreateInstance = NULL;
-    COSERVERINFO ServerInfo;
-    OLECHAR ServerName[OLE_BUF_SIZ];
+    STRLEN len;
 
     if (CallObjectMethod(mark, ax, items, "new"))
 	return;
@@ -1542,63 +1847,94 @@ PPCODE:
     if (items == 3)
 	destroy = CheckDestroyFunction(ST(2), "Win32::OLE::new");
 
-    ST(0) = &sv_undef;
-    Zero(&ServerInfo, 1, COSERVERINFO);
+    ST(0) = &PL_sv_undef;
 
-    /* DCOM spec: ['Servername', 'Program.ID'] */
-    if (SvROK(progid) && SvTYPE(SvRV(progid)) == SVt_PVAV) {
-	AV *av = (AV*)SvRV(progid);
-
-	/* DCOM might not exist on Win95 (and does not on NT 3.5) */
-	HMODULE hModule = GetModuleHandle("OLE32");
-	if (hModule != NULL) {
-	    pfnCreateInstance = (FNCOCREATEINSTANCEEX *)
-	                        GetProcAddress(hModule, "CoCreateInstanceEx");
-	}
-	if (pfnCreateInstance == NULL) {
-	    res = HRESULT_FROM_WIN32(ERROR_SERVICE_DOES_NOT_EXIST);
-	    ReportOleError(stash, res);
-	    XSRETURN(1);
-	}
-
-	SV *host = av_shift(av);
-	progid = av_shift(av);
-	buffer = SvPV(host, length);
-	ServerInfo.pwszName = GetWideChar(buffer, ServerName, OLE_BUF_SIZ, cp);
-    }
-
-    buffer = SvPV(progid, length);
-    pBuffer = GetWideChar(buffer, Buffer, OLE_BUF_SIZ, cp);
-    if (isalpha(pBuffer[0]))
-        res = CLSIDFromProgID(pBuffer, &clsid);
-    else
-        res = CLSIDFromString(pBuffer, &clsid);
-    ReleaseBuffer(pBuffer, Buffer);
-
-    if (SUCCEEDED(res)) {
-	IDispatch *pDispatch = NULL;
-
-	if (pfnCreateInstance == NULL || ServerInfo.pwszName == NULL) {
-	    res = CoCreateInstance(clsid, NULL, CLSCTX_SERVER, 
-				   IID_IDispatch, (void**)&pDispatch);
-	}
-	else {
-	    MULTI_QI multi_qi;
-	    Zero(&multi_qi, 1, MULTI_QI);
-	    multi_qi.pIID = &IID_IDispatch;
-
-	    res = pfnCreateInstance(clsid, NULL, CLSCTX_SERVER, &ServerInfo,
-				    1, &multi_qi);
-	    pDispatch = (IDispatch *)multi_qi.pItf;
-	}
-
+    /* normal case: no DCOM */
+    if (!SvROK(progid) || SvTYPE(SvRV(progid)) != SVt_PVAV) {
+	pBuffer = GetWideChar(SvPV(progid, len), Buffer, OLE_BUF_SIZ, cp);
+	if (isalpha(pBuffer[0]))
+	    res = CLSIDFromProgID(pBuffer, &clsid);
+	else
+	    res = CLSIDFromString(pBuffer, &clsid);
+	ReleaseBuffer(pBuffer, Buffer);
+ DBG(("CLSID.. returned res=0x%08x\n", res));
 	if (SUCCEEDED(res)) {
+	    res = CoCreateInstance(clsid, NULL, CLSCTX_SERVER,
+				   IID_IDispatch, (void**)&pDispatch);
+ DBG(("CoCreateInstance.. returned res=0x%08x\n", res));
+	}
+	if (!CheckOleError(stash, res)) {
 	    ST(0) = CreatePerlObject(stash, pDispatch, destroy);
 	    DBG(("Win32::OLE::new |%lx| |%lx|\n", ST(0), pDispatch));
 	}
+	XSRETURN(1);
     }
+
+    /* DCOM might not exist on Win95 (and does not on NT 3.5) */
+    dPERINTERP;
+    if (g_pfnCoCreateInstanceEx == NULL) {
+	res = HRESULT_FROM_WIN32(ERROR_SERVICE_DOES_NOT_EXIST);
+	ReportOleError(stash, res);
+	XSRETURN(1);
+    }
+
+    /* DCOM spec: ['Servername', 'Program.ID'] */
+    AV *av = (AV*)SvRV(progid);
+    if (av_len(av) != 1) {
+	warn("Win32::OLE->new: for DCOM use ['Machine', 'Prog.Id']");
+	XSRETURN(1);
+    }
+    SV *host = *av_fetch(av, 0, FALSE);
+    progid = *av_fetch(av, 1, FALSE);
+
+    /* determine hostname */
+    char *pszHost = NULL;
+    if (SvPOK(host)) {
+	pszHost = SvPV(host, len);
+	if (IsLocalMachine(pszHost))
+	    pszHost = NULL;
+    }
+
+    /* determine CLSID */
+    char *pszProgID = SvPV(progid, len);
+    pBuffer = GetWideChar(pszProgID, Buffer, OLE_BUF_SIZ, cp);
+    if (isalpha(pBuffer[0])) {
+	res = CLSIDFromProgID(pBuffer, &clsid);
+	if (FAILED(res) && pszHost != NULL)
+	    res = CLSIDFromRemoteRegistry(pszHost, pszProgID, &clsid);
+    }
+    else
+        res = CLSIDFromString(pBuffer, &clsid);
+    ReleaseBuffer(pBuffer, Buffer);
+    if (FAILED(res)) {
+	ReportOleError(stash, res);
+	XSRETURN(1);
+    }
+
+    /* setup COSERVERINFO & MULTI_QI parameters */
+    DWORD clsctx = CLSCTX_REMOTE_SERVER;
+    COSERVERINFO ServerInfo;
+    OLECHAR ServerName[OLE_BUF_SIZ];
+    MULTI_QI multi_qi;
+
+    Zero(&ServerInfo, 1, COSERVERINFO);
+    if (pszHost == NULL)
+	clsctx = CLSCTX_SERVER;
+    else
+	ServerInfo.pwszName = GetWideChar(pszHost, ServerName, OLE_BUF_SIZ, cp);
+
+    Zero(&multi_qi, 1, MULTI_QI);
+    multi_qi.pIID = &IID_IDispatch;
+
+    /* create instance on remote server */
+    res = g_pfnCoCreateInstanceEx(clsid, NULL, clsctx, &ServerInfo,
+				  1, &multi_qi);
     ReleaseBuffer(ServerInfo.pwszName, ServerName);
-    CheckOleError(stash, res);
+    if (!CheckOleError(stash, res)) {
+	pDispatch = (IDispatch*)multi_qi.pItf;
+	ST(0) = CreatePerlObject(stash, pDispatch, destroy);
+	DBG(("Win32::OLE::new |%lx| |%lx|\n", ST(0), pDispatch));
+    }
     XSRETURN(1);
 }
 
@@ -1626,6 +1962,8 @@ PPCODE:
     WINOLEOBJECT *pObj;
     EXCEPINFO excepinfo;
     DISPID dispID = DISPID_VALUE;
+    DISPID dispIDParam = DISPID_PROPERTYPUT;
+    USHORT wFlags = DISPATCH_METHOD | DISPATCH_PROPERTYGET;
     VARIANT result;
     DISPPARAMS dispParams;
     SV *curitem, *sv;
@@ -1634,7 +1972,7 @@ PPCODE:
     SV *err = NULL; /* error details */
     HRESULT res = S_OK;
 
-    ST(0) = &sv_no;
+    ST(0) = &PL_sv_no;
     Zero(&excepinfo, 1, EXCEPINFO);
     VariantInit(&result);
 
@@ -1655,15 +1993,24 @@ PPCODE:
     LCID lcid = QueryPkgVar(stash, LCID_NAME, LCID_LEN, lcidDefault);
     UINT cp = QueryPkgVar(stash, CP_NAME, CP_LEN, cpDefault);
 
+    /* allow [wFlags, 'Method'] instead of 'Method' */
+    if (SvROK(method) && (sv = SvRV(method)) &&	SvTYPE(sv) == SVt_PVAV &&
+	!SvOBJECT(sv) && av_len((AV*)sv) == 1)
+    {
+	wFlags = SvIV(*av_fetch((AV*)sv, 0, FALSE));
+	method = *av_fetch((AV*)sv, 1, FALSE);
+    }
+
     if (SvPOK(method)) {
 	buffer = SvPV(method, length);
 	if (length > 0) {
 	    res = GetHashedDispID(pObj, buffer, length, dispID, lcid, cp);
 	    if (FAILED(res)) {
-		err = sv_2mortal(newSVpvf(" in GetIDsOfNames \"%s\"", buffer));
-		ReportOleError(stash, res, NULL, err);
-		ST(0) = &sv_undef;
-		XSRETURN(1);
+		if (PL_hints & HINT_STRICT_SUBS) {
+		    err = newSVpvf(" in GetIDsOfNames of \"%s\"", buffer);
+		    ReportOleError(stash, res, NULL, sv_2mortal(err));
+		}
+		XSRETURN_UNDEF;
 	    }
 	}
     }
@@ -1680,6 +2027,13 @@ PPCODE:
     if (SvROK(curitem) && (sv = SvRV(curitem)) &&
 	SvTYPE(sv) == SVt_PVHV && !SvOBJECT(sv))
     {
+	if (wFlags & (DISPATCH_PROPERTYPUT|DISPATCH_PROPERTYPUTREF)) {
+	    warn("Win32::OLE->Dispatch: named arguments not supported "
+		 "for PROPERTYPUT");
+	    DEBUGBREAK;
+	    XSRETURN_UNDEF;
+	}
+
 	OLECHAR **rgszNames;
 	DISPID  *rgdispids;
 	HV      *hv = (HV*)sv;
@@ -1731,8 +2085,7 @@ PPCODE:
 			sv_catpv(err, error == cErrors ? " and " : ", ");
 		    sv_catpvf(err, "\"%s\"", hv_iterkey(rghe[index-1], &len));
 		}
-
-	    sv_catpvf(err, " in methodcall/getproperty \"%s\"", buffer);
+	    sv_catpvf(err, " in GetIDsOfNames for \"%s\"", buffer);
 	}
 
 	for (index = 0; index <= dispParams.cNamedArgs; ++index)
@@ -1761,8 +2114,13 @@ PPCODE:
 	}
     }
 
-    res = pObj->pDispatch->Invoke(dispID, IID_NULL, lcid,
-				  DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+    if (wFlags & (DISPATCH_PROPERTYPUT|DISPATCH_PROPERTYPUTREF)) {
+	Safefree(dispParams.rgdispidNamedArgs);
+	dispParams.rgdispidNamedArgs = &dispIDParam;
+	dispParams.cNamedArgs = 1;
+    }
+
+    res = pObj->pDispatch->Invoke(dispID, IID_NULL, lcid, wFlags,
 				  &dispParams, &result, &excepinfo, &argErr);
 
     if (FAILED(res)) {
@@ -1773,8 +2131,7 @@ PPCODE:
 
 	if (res == DISP_E_EXCEPTION && dispID > 0x8000) {
 	    Zero(&excepinfo, 1, EXCEPINFO);
-	    res = pObj->pDispatch->Invoke(dispID, IID_NULL, lcid,
-				  DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+	    res = pObj->pDispatch->Invoke(dispID, IID_NULL, lcid, wFlags,
 				  &dispParams, NULL, &excepinfo, &argErr);
 	}
     }
@@ -1787,12 +2144,13 @@ PPCODE:
 		VariantClear(&pVarObj->byref);
 		VariantClear(&pVarObj->variant);
 		VariantCopy(&pVarObj->variant, &result);
-		ST(0) = &sv_yes;
+		pVarObj->stash = stash; /* XXX refcount ??? */
+		ST(0) = &PL_sv_yes;
 	    }
 	}
 	else {
 	    res = SetSVFromVariant(&result, retval, stash);
-	    ST(0) = &sv_yes;
+	    ST(0) = &PL_sv_yes;
 	}
     }
     else {
@@ -1800,8 +2158,27 @@ PPCODE:
 	if (res == DISP_E_EXCEPTION && FAILED(excepinfo.scode))
 	    res = excepinfo.scode;
 
+	char *pszDelim = "";
 	err = sv_newmortal();
-	sv_setpvf(err, "in methodcall/getproperty \"%s\"", buffer);
+	sv_setpvf(err, "in ");
+
+	if (wFlags&DISPATCH_METHOD) {
+	    sv_catpv(err, "METHOD");
+	    pszDelim = "/";
+	}
+	if (wFlags&DISPATCH_PROPERTYGET) {
+	    sv_catpvf(err, "%sPROPERTYGET", pszDelim);
+	    pszDelim = "/";
+	}
+	if (wFlags&DISPATCH_PROPERTYPUT) {
+	    sv_catpvf(err, "%sPROPERTYPUT", pszDelim);
+	    pszDelim = "/";
+	}
+	if (wFlags&DISPATCH_PROPERTYPUTREF)
+	    sv_catpvf(err, "%sPROPERTYPUTREF", pszDelim);
+
+	sv_catpvf(err, " \"%s\"", buffer);
+
 	if (res == DISP_E_TYPEMISMATCH || res == DISP_E_PARAMNOTFOUND) {
 	    if (argErr < dispParams.cNamedArgs)
 		sv_catpvf(err, " argument \"%s\"", hv_iterkey(rghe[argErr], &len));
@@ -1818,7 +2195,8 @@ PPCODE:
 	Safefree(dispParams.rgvarg);
     }
     Safefree(rghe);
-    Safefree(dispParams.rgdispidNamedArgs);
+    if (dispParams.rgdispidNamedArgs != &dispIDParam)
+	Safefree(dispParams.rgdispidNamedArgs);
 
     CheckOleError(stash, res, &excepinfo, err);
 
@@ -1898,6 +2276,7 @@ PPCODE:
     char *buffer;
     ULONG ulEaten;
     HRESULT res;
+    STRLEN len;
 
     if (CallObjectMethod(mark, ax, items, "GetObject"))
 	return;
@@ -1926,7 +2305,7 @@ PPCODE:
     if (CheckOleError(stash, res))
 	XSRETURN_UNDEF;
 
-    buffer = SvPV(pathname, na);
+    buffer = SvPV(pathname, len);
     pBuffer = GetWideChar(buffer, Buffer, OLE_BUF_SIZ, cp);
     res = MkParseDisplayName(pBindCtx, pBuffer, &ulEaten, &pMoniker);
     ReleaseBuffer(pBuffer, Buffer);
@@ -2067,7 +2446,7 @@ PPCODE:
     HV *stash = SvSTASH(pObj->self);
     SetLastOleError(stash);
 
-    ST(0) = &sv_undef;
+    ST(0) = &PL_sv_undef;
     VariantInit(&result);
     VariantInit(&propName);
 
@@ -2104,7 +2483,7 @@ PPCODE:
 
     if (FAILED(res)) {
 	SV *sv = sv_newmortal();
-	sv_setpvf(sv, "in methodcall/getproperty \"%s\"", buffer);
+	sv_setpvf(sv, "in METHOD/PROPERTYGET \"%s\"", buffer);
 	VariantClear(&result);
 	ReportOleError(stash, res, &excepinfo, sv);
     }
@@ -2132,7 +2511,7 @@ PPCODE:
     HRESULT res;
     EXCEPINFO excepinfo;
     DISPID dispID = DISPID_VALUE;
-    DISPID dispIDParam;
+    DISPID dispIDParam = DISPID_PROPERTYPUT;
     DISPPARAMS dispParams;
     VARIANTARG propertyValue[2];
     SV *err = NULL;
@@ -2147,7 +2526,6 @@ PPCODE:
     LCID lcid = QueryPkgVar(stash, LCID_NAME, LCID_LEN, lcidDefault);
     UINT cp = QueryPkgVar(stash, CP_NAME, CP_LEN, cpDefault);
 
-    dispIDParam = DISPID_PROPERTYPUT;
     dispParams.rgdispidNamedArgs = &dispIDParam;
     dispParams.rgvarg = propertyValue;
     dispParams.cNamedArgs = 1;
@@ -2184,7 +2562,8 @@ PPCODE:
 				      &dispParams, NULL, &excepinfo, &argErr);
 	if (FAILED(res)) {
 	    err = sv_newmortal();
-	    sv_setpvf(err, "in setproperty \"%s\"", buffer);
+	    sv_setpvf(err, "in PROPERTYPUT%s \"%s\"",
+		      (wFlags == DISPATCH_PROPERTYPUTREF ? "REF" : ""), buffer);
 	}
     }
 
@@ -2306,7 +2685,8 @@ PPCODE:
     }
     else {
 	/* try to load registered typelib by classid, version and lcid */
-	char *pszBuffer = SvPV(classid, na);
+	STRLEN len;
+	char *pszBuffer = SvPV(classid, len);
 	pBuffer = GetWideChar(pszBuffer, Buffer, OLE_BUF_SIZ, cp);
 	res = CLSIDFromString(pBuffer, &clsid);
 	ReleaseBuffer(pBuffer, Buffer);
@@ -2317,7 +2697,7 @@ PPCODE:
 	res = LoadRegTypeLib(clsid, major, minor, lcid, &pTypeLib);
 	if (FAILED(res) && SvPOK(typelib)) {
 	    /* typelib not registerd, try to read from file "typelib" */
-	    pszBuffer = SvPV(typelib, na);
+	    pszBuffer = SvPV(typelib, len);
 	    pBuffer = GetWideChar(pszBuffer, Buffer, OLE_BUF_SIZ, cp);
 	    res = LoadTypeLib(pBuffer, &pTypeLib);
 	    ReleaseBuffer(pBuffer, Buffer);
@@ -2329,7 +2709,7 @@ PPCODE:
     if (SvOK(caller)) {
 	/* we'll define inlineable functions returning a const */
         hv = gv_stashsv(caller, TRUE);
-	ST(0) = &sv_undef;
+	ST(0) = &PL_sv_undef;
     }
     else {
 	/* we'll return ref to hash with constant name => value pairs */
@@ -2365,7 +2745,7 @@ PPCODE:
 	    if (pVarDesc->varkind == VAR_CONST &&
 		!(pVarDesc->wVarFlags & (VARFLAG_FHIDDEN |
 					 VARFLAG_FRESTRICTED |
-					 VARFLAG_FNONBROWSABLE))) 
+					 VARFLAG_FNONBROWSABLE)))
 	    {
 		unsigned int cName;
 		BSTR bstr;
@@ -2474,7 +2854,7 @@ PPCODE:
 
     int count = (items > 1) ? SvIV(ST(1)) : 1;
     if (count < 1) {
-	warn("Win32::OLE::Enum::Next: invalid Count %ld", count);
+	warn(MY_VERSION ": Win32::OLE::Enum::Next: invalid Count %ld", count);
 	DEBUGBREAK;
 	count = 1;
     }
@@ -2553,6 +2933,7 @@ PPCODE:
     New(0, pVarObj, 1, WINOLEVARIANTOBJECT);
     VariantInit(&pVarObj->variant);
     VariantInit(&pVarObj->byref);
+    pVarObj->stash = stash; /* XXX refcnt ??? */
     V_VT(&pVarObj->variant) = vt & ~VT_BYREF;
 
     /* XXX requirement to call mg_get() may change in Perl > 5.004 */
@@ -2611,6 +2992,7 @@ PPCODE:
 	else {
 	    pObj->pDispatch->AddRef();
 	    V_DISPATCH(&pVarObj->variant) = pObj->pDispatch;
+	    pVarObj->stash = SvSTASH(pObj->self); /* XXX refcnt ??? */
 	}
 	break;
     }
@@ -2636,6 +3018,7 @@ PPCODE:
 	else {
 	    res = pObj->pDispatch->QueryInterface(IID_IUnknown,
 			           (void**)&V_UNKNOWN(&pVarObj->variant));
+	    pVarObj->stash = SvSTASH(pObj->self); /* XXX refcnt ??? */
 	    CheckOleError(SvSTASH(pObj->self), res);
 	}
 	break;
@@ -2668,7 +3051,7 @@ PPCODE:
 	break;
 
     default:
-	warn("Win32::OLE::Variant::new: Invalid value type %d",
+	warn(MY_VERSION ": Win32::OLE::Variant::new: Invalid value type %d",
 	     V_VT(&pVarObj->variant));
 	DEBUGBREAK;
 	Safefree(pVarObj);
@@ -2699,6 +3082,7 @@ PPCODE:
 	RemoveFromObjectChain((OBJECTHEADER*)pVarObj);
 	VariantClear(&pVarObj->byref);
 	VariantClear(&pVarObj->variant);
+	/* XXX dec refcnt(stash) ??? */
 	Safefree(pVarObj);
     }
 
@@ -2714,15 +3098,15 @@ PPCODE:
 {
     WINOLEVARIANTOBJECT *pVarObj = GetOleVariantObject(self);
 
-    ST(0) = &sv_undef;
+    ST(0) = &PL_sv_undef;
     if (pVarObj != NULL) {
 	HV *stash = GetStash(self);
-	SetLastOleError(stash);
+	SetLastOleError(stash); /* XXX */
 	ST(0) = sv_newmortal();
 	if (ix == 0)
 	    sv_setiv(ST(0), V_VT(&pVarObj->variant));
 	else
-	    SetSVFromVariant(&pVarObj->variant, ST(0), stash);
+	    SetSVFromVariant(&pVarObj->variant, ST(0), pVarObj->stash);
     }
     XSRETURN(1);
 }
@@ -2735,7 +3119,7 @@ PPCODE:
 {
     WINOLEVARIANTOBJECT *pVarObj = GetOleVariantObject(self);
 
-    ST(0) = &sv_undef;
+    ST(0) = &PL_sv_undef;
     if (pVarObj != NULL) {
 	HRESULT res;
 	VARIANT variant;
@@ -2747,7 +3131,7 @@ PPCODE:
 	res = VariantChangeTypeEx(&variant, &pVarObj->variant, lcid, 0, type);
 	if (SUCCEEDED(res)) {
 	    ST(0) = sv_newmortal();
-	    SetSVFromVariant(&variant, ST(0), SvSTASH(SvRV(self)));
+	    SetSVFromVariant(&variant, ST(0), pVarObj->stash);
 	}
 	VariantClear(&variant);
 	CheckOleError(stash, res);
@@ -2770,13 +3154,13 @@ PPCODE:
 
 	SetLastOleError(stash);
 	/* XXX: Does it work with VT_BYREF? */
-	res = VariantChangeTypeEx(&pVarObj->variant, &pVarObj->variant, 
+	res = VariantChangeTypeEx(&pVarObj->variant, &pVarObj->variant,
 				  lcid, 0, type);
 	CheckOleError(stash, res);
     }
 
     if (FAILED(res))
-	ST(0) = &sv_undef;
+	ST(0) = &PL_sv_undef;
 
     XSRETURN(1);
 }
@@ -2788,7 +3172,7 @@ PPCODE:
 {
     WINOLEVARIANTOBJECT *pVarObj = GetOleVariantObject(self);
 
-    ST(0) = &sv_undef;
+    ST(0) = &PL_sv_undef;
     if (pVarObj != NULL) {
 	HV *stash = GetStash(self);
 	VARIANT Variant;
@@ -2805,15 +3189,16 @@ PPCODE:
 	}
 
 	if (!CheckOleError(stash, res)) {
-	    BSTR bstr = V_ISBYREF(pVariant) ? *V_BSTRREF(pVariant) 
+	    BSTR bstr = V_ISBYREF(pVariant) ? *V_BSTRREF(pVariant)
 		                            : V_BSTR(pVariant);
-	    STRLEN len = SysStringLen(bstr);
-	    SV *sv = newSVpv((char*)bstr, 2*len);
-	    U16 *pus = (U16 *)SvPV(sv, na);
-	    for (STRLEN i=0 ; i < len ; ++i)
+	    STRLEN olecharlen = SysStringLen(bstr);
+	    SV *sv = newSVpv((char*)bstr, 2*olecharlen);
+	    STRLEN len;
+	    U16 *pus = (U16 *)SvPV(sv, len);
+	    for (STRLEN i=0 ; i < olecharlen ; ++i)
 		pus[i] = htons(pus[i]);
 
-	    ST(0) = sv_2mortal(sv_bless(newRV_noinc(sv), 
+	    ST(0) = sv_2mortal(sv_bless(newRV_noinc(sv),
 					gv_stashpv("Unicode::String", TRUE)));
 	}
 	VariantClear(&Variant);

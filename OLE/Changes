@@ -1,5 +1,81 @@
 Revision history for Perl extension Win32::OLE.
 
+0.10	Thu Sep 10 17:32:16 1998
+	- memory corruption fix (for ->SetProperty) method by Gurusamy Sarathy.
+	- document *nitialize(), SpinMessageLoop()
+
+0.0902	(unreleased)
+	- Allow specification of apartment model to Initialize() method. Special
+	  case is COINIT_OLEINITIALIZE to fall back to OleInitialize(). This
+	  is required to instantiate objects using compound document technology,
+	  like e.g. "MAPI.Session".
+	- Compatibility module now uses OleInitilize()
+
+0.0901	(unreleased)
+	- PL_na replaced by local variables
+	- Dispatch method now accepts [wFlags, 'method'] to specify
+	  various dispatch flags, e.g. DISPATCH_PROPERTYPUT
+	- new $Obj->SetProperty() methods supports setting properties
+	  with parameters
+	- bug fix: the DCOM spec ['host', 'prog.id'] is no longer 'shifted'
+	- more doc tweaks
+
+0.09	(unreleased)
+	- fix conversion from VT_DISPATCH/VT_UNKNOWN Win32::OLE::Variant objects
+	  into Win32::OLE objects (were previously blessed into wrong class)
+	- dynamically load CoInitializeEx to make OLE.dll compatible with 
+	  "Win95 without DCOM" once again
+	- convert Perl globals to PL_xxx form (with defines for Perl 5.004_xx)
+	- minor doc tweaks
+	- call CoFreeUnusedLibraries() whenever an OLE object is released
+
+0.0810  (unreleased, maybe PRK for Win32 version, included by ActivePerl 501)
+	- Removed USE_SV_PERINTERP, perl_atexit() only used for 5.004_68 and up
+
+0.0809  (unreleased) identical to 0.0808
+
+0.0808  (unreleased)
+	- Introduced USE_SV_PERINTERP to switch off perl_atexit() usage
+
+0.0807  (unreleased)
+	- OleInitialize replaced by CoInitializeEx(NULL, COINIT_MULTITHREADED)
+	  (as suggested by James Snyder). This gets rid of the hidden top-level
+	  window problem.
+	- Fixed warning in Win32::OLE::Const when called without arg
+
+0.0806  (unreleased)
+	- Bug fixes for IsLocalMachine()
+	- Free per-interpreter memory area at interpreter-exit
+	- Bootstrap no longer static function
+	- Use MY_VERSION as key/variable name for per-interpreter data
+
+0.0805  (unreleased)
+	- Never do CLSID lookup by registry on local machine
+	- try to use socket APIs too to determine host identity
+	- make all globals per-interpreter variables / remove DllMain
+	- proper per-interpreter cleanup for all Perl versions
+
+0.0804  (unreleased)
+	- Fix breakage in GetOleObject (from 0.0801) for 5.004_04 and earlier
+	- Ignore DCOM hostname if it seems to be the local machine
+
+0.0803  (unreleased)
+	- Rearrange t/3_ole.t to behave nicely when Excel is not installed
+	- Win32::OLE->Dispatch: only warn about unidentifiable method name
+	  when C<use strict "subs"> is in effect (kind of)
+	- Most error msgs and warnings are prefixed with Win32::OLE version#
+
+0.0802  (unreleased)
+	- Win32::OLE->new(['Machine', 'Prog.Id']) does a remote registry lookup
+	  if the Prog.Id is not registered locally.
+	- CLSCTX changed to CLSCTX_REMOTE_SERVER when a machine is specified.
+	  Otherwise OLE would still prefer a local server when available
+
+0.0801  (unreleased)
+	- Win32::OLE::Tie::(FETCH|STORE) now interpret $^H correctly
+	- removed all Perl related stuff from DllMain (for embedded stuff)
+	- Additional checks in GetOleObject for Perl 5.004_05 or later
+
 0.08    Mon May 11 03:36:49 1998
 	- Make sure mg_get() gets called during GetOleObject()
 
