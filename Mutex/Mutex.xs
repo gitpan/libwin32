@@ -1,13 +1,13 @@
-// Mutex.xs
-// XS file for the Mutex IPC module extension
-
-// Mutex object creation layer.
-
-#define WIN32_LEAN_AND_MEAN
-#include <stdlib.h>
-#include <math.h>		// avoid VC-5.0 brainmelt
-#include <windows.h>
-#include "Mutex.hpp"
+//--------------------------------------------------------------------
+// $Id$
+//--------------------------------------------------------------------
+//
+//   Win32::Mutex
+//   Copyright 1998 by Christopher J. Madsen
+//
+//   XS file for the Win32::Mutex IPC module
+//
+//--------------------------------------------------------------------
 
 #if defined(__cplusplus)
 extern "C" {
@@ -17,87 +17,61 @@ extern "C" {
 #include "perl.h"
 #include "XSUB.h"
 
-
-BOOL
-Create( Mutex* &cMu, BOOL bInitial, LPCTSTR lpName)
-{
-	cMu =(Mutex *) new Mutex( bInitial, lpName );
-	return( cMu != NULL );
-
-}
-
-BOOL
-Open( Mutex* &cMu,LPCSTR lpName )
-{
-	HANDLE hMutex;
-
-	cMu = NULL;
-
-	// note: the mutex is inheritable.
-
-	hMutex = OpenMutex( MUTEX_ALL_ACCESS, TRUE,lpName);
-
-	
-	if( hMutex != NULL)	
-		cMu = (Mutex *)new Mutex(hMutex); 
-
-	return( cMu != NULL );
-}
- 
 #if defined(__cplusplus)
 }
 #endif
 
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+
+
 MODULE = Win32::Mutex		PACKAGE = Win32::Mutex
 
-PROTOTYPES: DISABLE
+PROTOTYPES: ENABLE
 
 
-BOOL
-Create(cMu, initial, name)
-    Mutex *cMu = NO_INIT
-    BOOL initial
-    LPCTSTR name
+HANDLE
+new(className, initial=FALSE, name=NULL)
+    char*  className
+    BOOL   initial
+    LPCSTR name
+PREINIT:
+      SECURITY_ATTRIBUTES  sec;
 CODE:
-    RETVAL = Create(cMu, initial, name);
+    sec.nLength = sizeof(SECURITY_ATTRIBUTES);
+    sec.bInheritHandle = TRUE;        // allow inheritance
+    sec.lpSecurityDescriptor = NULL;  // calling processes' security
+    RETVAL = CreateMutex(&sec,initial,name);
+    if (RETVAL == INVALID_HANDLE_VALUE)
+      XSRETURN_UNDEF;
 OUTPUT:
-    cMu
     RETVAL
 
 
-BOOL
-Open(cMu, name)
-    Mutex *cMu = NO_INIT
+HANDLE
+open(className, name)
+    char*  className
     LPCSTR name
 CODE:
-    RETVAL = Open(cMu, name);
-OUTPUT:
-    cMu
-    RETVAL
-
-
-BOOL
-Release(cMu)
-    Mutex *cMu
-CODE:
-    RETVAL = cMu->Release();
+    RETVAL = OpenMutex(MUTEX_ALL_ACCESS, TRUE, name);
+    if (RETVAL == INVALID_HANDLE_VALUE)
+      XSRETURN_UNDEF;
 OUTPUT:
     RETVAL
 
 
 void
-DESTROY(cMu)
-    Mutex *cMu
+DESTROY(mutex)
+    HANDLE mutex
 CODE:
-   cMu->~Mutex();
+    if (mutex != INVALID_HANDLE_VALUE)
+      CloseHandle(mutex);
 
 
 BOOL
-Wait(cMu,timeout)
-    Mutex *cMu
-    DWORD timeout
+release(mutex)
+    HANDLE mutex
 CODE:
-    RETVAL = cMu->Wait(timeout);
+    RETVAL = ReleaseMutex(mutex);
 OUTPUT:
     RETVAL
-
