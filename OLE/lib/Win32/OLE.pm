@@ -4,9 +4,9 @@ package Win32::OLE;
 
 use strict;
 use vars qw($VERSION @ISA @EXPORT @EXPORT_OK @EXPORT_FAIL $AUTOLOAD
-	    $CP $LCID $Warn $LastError);
+	    $CP $LCID $Warn $LastError $_NewEnum $_Unique);
 
-$VERSION = '0.1101';
+$VERSION = '0.13';
 
 use Carp;
 use Exporter;
@@ -126,6 +126,21 @@ The EnumAllObjects() method is primarily a debugging tool.  It can be
 used e.g. in an END block to check if all external connections have
 been properly destroyed.
 
+=item Win32::OLE->FreeUnusedLibraries()
+
+The FreeUnusedLibraries() class method unloads all unused OLE
+resources.  These are the libraries of those classes of which all
+existing objects have been destroyed.  The unloading of object
+libraries is really only important for long running processes that
+might instantiate a huge number of B<different> objects over time.
+
+Be aware that objects implemented in Visual Basic have a buggy
+implementation of this functionality: They pretend to be unloadable
+while they are actually still running their cleanup code.  Unloading
+the DLL at that moment typically produces an access violation.  The
+probability for this problem can be reduced by calling the
+SpinMessageLoop() method and sleep()ing for a few seconds.
+
 =item Win32::OLE->GetActiveObject(CLASS[, DESTRUCTOR])
 
 The GetActiveObject() class method returns an OLE reference to a
@@ -223,6 +238,12 @@ you have to use the LetProperty() object method in Perl:
 LetProperty() also supports optional arguments for the property assignment.
 See L<OBJECT->SetProperty(NAME,ARGS,VALUE)> for details.
 
+=item Win32::OLE->MessageLoop()
+
+The MessageLoop() class method will run a standard Windows message
+loop, dispatching messages until the QuitMessageLoop() class method is
+called.  It is used to wait for OLE events.
+
 =item Win32::OLE->Option(OPTION)
 
 The Option() class method can be used to inspect and modify
@@ -241,6 +262,13 @@ The QueryObjectType() class method returns a list of the type library
 name and the objects class name.  In a scalar context it returns the
 class name only.  It returns C<undef> when the type information is not
 available.
+
+=item Win32::OLE->QuitMessageLoop()
+
+The QuitMessageLoop() class method posts a (user-level) "Quit" message
+to the current threads message loop.  QuitMessageLoop() is typically
+called from an event handler.  The MessageLoop() class method will
+return when it receives this "Quit" method.
 
 =item OBJECT->SetProperty(NAME,ARGS,VALUE)
 
@@ -519,6 +547,69 @@ an error happens.  Valid values are:
 
 The error number and message (without Carp line/module info) are
 available through the C<Win32::OLE->LastError> class method.
+
+Alternatively the Warn option can be set to a CODE reference.  E.g.
+
+    Win32::OLE->Option(Warn => 3);
+
+is equivalent to
+
+    Win32::OLE->Option(Warn => \&Carp::croak);
+
+This can even be used to emulate the VisualBasic C<On Error Goto
+Label> construct:
+
+    Win32::OLE->Option(Warn =>  sub {goto CheckError});
+    # ... your normal OLE code here ...
+
+  CheckError:
+    # ... your error handling code here ...
+
+=item _NewEnum
+
+This option enables additional enumeration support for collection
+objects.  When the C<_NewEnum> option is set, all collections will
+receive one additional property: C<_NewEnum>.  The value of this
+property will be a reference to an array containing all the elements
+of the collection.  This option can be useful when used in conjunction
+with an automatic tree traversal program, like C<Data::Dumper> or an
+object tree browser.  The value of this option should be either 1
+(enabled) or 0 (disabled, default).
+
+    Win32::OLE->Option(_NewEnum => 1);
+    # ...
+    my @sheets = @{$Excel->Worksheets->{_NewEnum}};
+
+In normal application code, this would be better written as:
+
+    use Win32::OLE qw(in);
+    # ...
+    my @sheets = in $Excel->Worksheets;
+
+=item _Unique
+
+The C<_Unique> options guarantees that Win32::OLE will maintain a
+one-to-one mapping between Win32::OLE objects and the native COM/OLE
+objects.  Without this option, you can query the same property twice
+and get two different Win32::OLE objects for the same underlying COM
+object.
+
+Using a unique proxy makes life easier for tree traversal algorithms
+to recognize they already visited a particular node.  This option
+comes at a price: Win32::OLE has to maintain a global hash of all
+outstanding objects and their corresponding proxies.  Identity checks
+on COM objects can also be expensive if the objects reside
+out-of-process or even on a different computer.  Therefore this option
+is off by default unless the program is being run in the debugger.
+
+Unfortunately, this option doesn't always help.  Some programs will
+return new COM objects for even the same property when asked for it
+multiple times (especially for collections).  In this case, there is
+nothing Win32::OLE can do to detect that these objects are in fact
+identical (because they aren't at the COM level).
+
+The C<_Unique> option can be set to either 1 (enabled) or 0 (disabled,
+default).
 
 =back
 
@@ -850,7 +941,7 @@ related questions only, of course).
     Developed by ActiveWare Internet Corp., now known as
     ActiveState Tool Corp., http://www.ActiveState.com
 
-    Other modifications Copyright (c) 1997-1999 by Gurusamy Sarathy
+    Other modifications Copyright (c) 1997-2000 by Gurusamy Sarathy
     <gsar@activestate.com> and Jan Dubois <jand@activestate.com>
 
     You may distribute under the terms of either the GNU General Public
@@ -858,6 +949,6 @@ related questions only, of course).
 
 =head1 VERSION
 
-Version 0.1101	  24 September 1999
+Version 0.13	  9 May 2000
 
 =cut

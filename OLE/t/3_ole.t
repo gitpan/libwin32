@@ -8,34 +8,44 @@
 ########################################################################
 
 package Excel;
+use strict;
 use Win32::OLE;
 
 use strict qw(vars);
-use vars qw($AUTOLOAD @ISA $Warn $LastError $CP $LCID);
+use vars qw($AUTOLOAD @ISA $Warn $LastError $CP $LCID $Tie);
 # use BEGIN because the class is already used in BEGIN block later
-BEGIN { @ISA = qw(Win32::OLE); }
-
-$CP   = Win32::OLE->Option('CP');
-$LCID = Win32::OLE->Option('LCID');
+BEGIN {
+    @ISA = qw(Win32::OLE);
+    $CP   = Win32::OLE->Option('CP');
+    $LCID = Win32::OLE->Option('LCID');
+    # This is necessary to get the _NewEnum property access working!
+    $Tie  = "Excel::Tie";
+    @Excel::Tie::ISA = qw(Win32::OLE::Tie);
+}
 
 sub AUTOLOAD {
-  my $self = shift;
-  $AUTOLOAD =~ s/.*::/SUPER::/;
-  my $retval = $self->$AUTOLOAD(@_);
-  return $retval if defined($retval) || $AUTOLOAD eq 'DESTROY';
-  printf "# $AUTOLOAD returned OLE error 0x%08x\n", $LastError;
-  $::Fail = $::Test;
-  return;
+    my $self = shift;
+    $AUTOLOAD =~ s/.*::/SUPER::/;
+    my $retval = $self->$AUTOLOAD(@_);
+    return $retval if defined($retval) || $AUTOLOAD eq 'DESTROY';
+    printf "# $AUTOLOAD returned OLE error 0x%08x\n", $LastError;
+    $::Fail = $::Test;
+    return;
 }
 
 ########################################################################
 
 package main;
 use strict;
+
+use Cwd;
 use FileHandle;
-use Win32::OLE qw(CP_ACP CP_OEMCP HRESULT in valof with OVERLOAD);
+use Sys::Hostname;
+
+use Win32::OLE qw(CP_ACP CP_OEMCP HRESULT in valof with);
 use Win32::OLE::NLS qw(:DEFAULT :LANG :SUBLANG);
 use Win32::OLE::Variant;
+
 use vars qw($Test $Fail);
 
 $^W = 1;
@@ -74,12 +84,11 @@ BEGIN {
     $Excel = Excel->new('Excel.Application', \&Quit);
     $Excel::Warn = 2;
     unless (defined $Excel) {
-	print "# Excel.Application not installed!\n";
 	my $Msg = Excel->LastError;
 	chomp $Msg;
 	$Msg =~ s/\n/\n\# /g;
 	print "# $Msg\n";
-	print "1..0\n";
+	print "1..0 # Skipped: Excel.Application not installed\n";
 	exit 0;
     }
 }
@@ -88,10 +97,11 @@ use Win32::OLE::Const ('Microsoft Excel');
 
 $Test = 0;
 print "1..$TestCount\n";
-my $File = Win32::GetCwd . "\\test.xls";
+my $File = cwd . "\\test.xls";
+$File =~ s#\\#/#g, chomp($File = `cygpath -w '$File'`) if $^O eq 'cygwin';
 unlink $File if -f $File;
 
-printf "# Excel is %s\n", overload::StrVal($Excel);
+printf "# Excel is %s\n", $Excel;
 my $Type = Win32::OLE->QueryObjectType($Excel);
 print "# App object type is $Type\n";
 printf "ok %d\n", ++$Test;
@@ -126,50 +136,69 @@ printf "ok %d\n", ++$Test;
 # 6. Generate OLE error, should be trapped by Excel subclass
 $Fail = -1;
 { local $Excel::Warn = 0; $Book->Xyzzy(223); };
-printf "# Excel::LastError returns (num): %08x\n", Excel->LastError();
+printf "# Excel::LastError returns (num): 0x%08x\n", Excel->LastError();
 $Msg = Excel->LastError();
 $Msg =~ s/\n/\n\# /g;
 printf "# Excel::LastError returns (str):\n# $Msg\n";
 Excel->LastError(0);
-printf "# Excel::LastError returns (num): %08x\n", Excel->LastError();
+printf "# Excel::LastError returns (num): 0x%08x\n", Excel->LastError();
 printf "# Excel::LastError returns (str): %s\n", Excel->LastError();
 print "not " if $Fail != $Test;
 printf "ok %d\n", ++$Test;
 
-# 7. Get an object for 1st worksheet
+# 7. Set 'Warn' option to subroutine reference
+$Msg = '';
+Excel->Option(Warn => sub {goto Error});
+$Book->Plugh(42);
+$Msg = "not ";
+Error:
+printf "${Msg}ok %d\n", ++$Test;
+Excel->Option(Warn => 2);
+
+# 8. Get an object for 1st worksheet
 my $Sheet = $Book->Worksheets(1);
-print "not " unless defined $Sheet;
 $Type = Win32::OLE->QueryObjectType($Sheet);
 print "# Sheet object type is $Type\n";
+print "not " unless defined $Sheet;
 printf "ok %d\n", ++$Test;
 
-# 8. Test the "with" function
+# 9. Catch "invalid type" error, test if index is correct
+{ local $Excel::Warn = 0; $Sheet->Cells(1, $Sheet); };
+$Msg = Excel->LastError();
+$Msg =~ s/\n/\n\# /g;
+printf "# Excel::LastError returns (str):\n# $Msg\n";
+print "not " unless $Msg =~ /"Cells" argument 2/;
+printf "ok %d\n", ++$Test;
+
+# 10. Test the "with" function
+printf("# Tests %d and %d will fail if no default printer has been installed yet\n",
+       $Test+1, $Test+2);
 with($Sheet->PageSetup, Orientation => xlLandscape, FirstPageNumber => 13);
 $Value = $Sheet->PageSetup->FirstPageNumber;
 print "# FirstPageNumber is \"$Value\"\n";
 print "not " unless $Value == 13;
 printf "ok %d\n", ++$Test;
 
-# 9. Test constant value: xlLandscape should be "2"
+# 11. Test constant value: xlLandscape should be "2"
 $Value = $Sheet->PageSetup->Orientation;
 print "# Orientation is \"$Value\"\n";
 print "not " unless $Value == 2;
 printf "ok %d\n", ++$Test;
 
-# 10. Test Win32::OLE::Const->Load method
+# 12. Test Win32::OLE::Const->Load method
 my $xl = Win32::OLE::Const->Load('Microsoft Excel');
 printf "# xlLandscape is \"%s\"\n", $xl->{'xlLandscape'};
 print "not " unless $xl->{'xlLandscape'} == 2;
 printf "ok %d\n", ++$Test;
 
-# 11. Call a method with a magical scalar as argument
+# 13. Call a method with a magical scalar as argument
 my $Sheets = $Book->Worksheets;
 my $Name = $Book->Worksheets($Sheets->{Count})->{Name};
 print "# Name is \"$Name\"\n";
 print "not " unless $Name;
 printf "ok %d\n", ++$Test;
 
-# 12. Set values of some cells and retrieve a value
+# 14. Set values of some cells and retrieve a value
 $Sheet->{Name} = 'My Sheet #1';
 foreach my $i (1..10) {
   $Sheet->Cells($i,$i)->{Value} = $i**2;
@@ -182,30 +211,25 @@ print "# Value is \"$Value\"\n";
 print "not " unless $Cell->{Value} == 25;
 printf "ok %d\n", ++$Test;
 
-# 13. Check if overloading conversion to number/string works
-print "# Value is \"$Cell\"\n";
-print "not " unless $Cell == 25;
-printf "ok %d\n", ++$Test;
-
-# 14. Test the valof function
+# 15. Test the valof function
 my $RefOf = $Cell;
 my $ValOf = valof $Cell;
 $Cell->{Value} = 27;
-print "not " unless $ValOf == 25 && $RefOf == 27;
+print "not " unless $ValOf == 25 && $RefOf->Value == 27;
 printf "ok %d\n", ++$Test;
 
-# 15. Test 'SetProperty' function
+# 16. Test 'SetProperty' function
 $Cell->SetProperty('Value', 4711);
 printf "# Value is %s\n", $Cell->Value;
 print "not " unless $Cell->Value == 4711;
 printf "ok %d\n", ++$Test;
 
-# 16. The following tests rely on the fact that the font is not yet bold
+# 17. The following tests rely on the fact that the font is not yet bold
 printf "# Bold: %s\n", $Cell->Style->Font->Bold;
 print "not " if $Cell->Style->Font->Bold;
 printf "ok %d\n", ++$Test;
 
-# 17. Assignment by DISPATCH_PROPERTYPUTREF shouldn't work
+# 18. Assignment by DISPATCH_PROPERTYPUTREF shouldn't work
 my $Style = $Book->Styles->Add("MyStyle");
 $Style->Font->{Bold} = 1;
 { local $Excel::Warn = 0; $Cell->{Style} = $Style }
@@ -215,63 +239,63 @@ printf "# Excel->LastError is 0x%x\n", $LastError;
 print "not " if $LastError != HRESULT(0x80020003) || $Cell->Style->Font->Bold;
 printf "ok %d\n", ++$Test;
 
-# 18. But DISPATCH_PROPERTYPUT should be ok
+# 19. But DISPATCH_PROPERTYPUT should be ok
 $Cell->LetProperty('Style', $Style);
 printf "# Bold: %s\n", $Cell->Style->Font->Bold;
 print "not " unless $Cell->Style->Font->Bold;
 printf "ok %d\n", ++$Test;
 
-# 19. Set a cell range from an array ref containing an IV, PV and NV
+# 20. Set a cell range from an array ref containing an IV, PV and NV
 $Sheet->Range("A8:C9")->{Value} = [[undef, 'Camel'],[42, 'Perl', 3.1415]];
-$Value = $Sheet->Cells(9,2) . $Sheet->Cells(8,2);
+$Value = $Sheet->Cells(9,2)->Value . $Sheet->Cells(8,2)->Value;
 print "# Value is \"$Value\"\n";
 print "not " unless $Value eq 'PerlCamel';
 printf "ok %d\n", ++$Test;
 
-# 20. Retrieve float value (esp. interesting in foreign locales)
+# 21. Retrieve float value (esp. interesting in foreign locales)
 $Value = $Sheet->Cells(9,3)->{Value};
 print "# Value is \"$Value\"\n";
 print "not " unless $Value == 3.1415;
 printf "ok %d\n", ++$Test;
 
-# 21. Retrieve a 0 dimensional range; check array data structure
+# 22. Retrieve a 0 dimensional range; check array data structure
 $Value = $Sheet->Range("B8")->{Value};
 printf "# Values are: \"%s\"\n", stringify($Value);
 print "not " if ref $Value;
 printf "ok %d\n", ++$Test;
 
-# 22. Retrieve a 1 dimensional row range; check array data structure
+# 23. Retrieve a 1 dimensional row range; check array data structure
 $Value = $Sheet->Range("B8:C8")->{Value};
 printf "# Values are: \"%s\"\n", stringify($Value);
 print "not " unless @$Value == 1 && ref $$Value[0];
 printf "ok %d\n", ++$Test;
 
-# 23. Retrieve a 1 dimensional column range; check array data structure
+# 24. Retrieve a 1 dimensional column range; check array data structure
 $Value = $Sheet->Range("B8:B9")->{Value};
 printf "# Values are: \"%s\"\n", stringify($Value);
 print "not " unless @$Value == 2 && ref $$Value[0] && ref $$Value[1];
 printf "ok %d\n", ++$Test;
 
-# 24. Retrieve a 2 dimensional range; check array data structure
+# 25. Retrieve a 2 dimensional range; check array data structure
 $Value = $Sheet->Range("B8:C9")->{Value};
 printf "# Values are: \"%s\"\n", stringify($Value);
 print "not " unless @$Value == 2 && ref $$Value[0] && ref $$Value[1];
 printf "ok %d\n", ++$Test;
 
-# 25. Check contents of 2 dimensional array
+# 26. Check contents of 2 dimensional array
 $Value = $$Value[0][0] . $$Value[1][0] . $$Value[1][1];
 print "# Value is \"$Value\"\n";
 print "not " unless $Value eq 'CamelPerl3.1415';
 printf "ok %d\n", ++$Test;
 
-# 26. Set a cell formula and retrieve calculated value
+# 27. Set a cell formula and retrieve calculated value
 $Sheet->Cells(3,1)->{Formula} = '=PI()';
 $Value = $Sheet->Cells(3,1)->{Value};
 print "# Value is \"$Value\"\n";
 print "not " unless abs($Value-3.141592) < 0.00001;
 printf "ok %d\n", ++$Test;
 
-# 27. Add single worksheet and check that worksheet count is incremented
+# 28. Add single worksheet and check that worksheet count is incremented
 my $Count = $Sheets->{Count};
 $Book->Worksheets->Add;
 $Value = $Sheets->{Count};
@@ -279,7 +303,7 @@ print "# Count is \"$Count\" and Value is \"$Value\"\n";
 print "not " unless $Value == $Count+1;
 printf "ok %d\n", ++$Test;
 
-# 28. Add 2 more sheets, optional arguments are omitted
+# 29. Add 2 more sheets, optional arguments are omitted
 $Count = $Sheets->{Count};
 $Book->Worksheets->Add(undef,undef,2);
 $Value = $Sheets->{Count};
@@ -287,7 +311,7 @@ print "# Count is \"$Count\" and Value is \"$Value\"\n";
 print "not " unless $Value == $Count+2;
 printf "ok %d\n", ++$Test;
 
-# 29. Add 3 more sheets before sheet 2 using a named argument
+# 30. Add 3 more sheets before sheet 2 using a named argument
 $Count = $Sheets->{Count};
 $Book->Worksheets(2)->{Name} = 'XYZZY';
 $Sheets->Add($Book->Worksheets(2), {Count => 3});
@@ -296,13 +320,13 @@ print "# Count is \"$Count\" and Value is \"$Value\"\n";
 print "not " unless $Value == $Count+3;
 printf "ok %d\n", ++$Test;
 
-# 30. Previous sheet 2 should now be sheet 5
+# 31. Previous sheet 2 should now be sheet 5
 $Value = $Book->Worksheets(5)->{Name};
 print "# Value is \"$Value\"\n";
 print "not " unless $Value eq 'XYZZY';
 printf "ok %d\n", ++$Test;
 
-# 31. Add 2 more sheets at the end using 2 named arguments
+# 32. Add 2 more sheets at the end using 2 named arguments
 $Count = $Sheets->{Count};
 # Following line doesn't work with Excel 7 (Seems like an Excel bug?)
 # $Sheets->Add({Count => 2, After => $Book->Worksheets($Sheets->{Count})});
@@ -310,7 +334,7 @@ $Sheets->Add({Count => 2, After => $Book->Worksheets($Sheets->{Count}-1)});
 print "not " unless $Sheets->{Count} == $Count+2;
 printf "ok %d\n", ++$Test;
 
-# 32. Number of objects in an enumeration must match its "Count" property
+# 33. Number of objects in an enumeration must match its "Count" property
 my @Sheets = in $Sheets;
 printf "# \$Sheets->{Count} is %d\n", $Sheets->{Count};
 printf "# scalar(\@Sheets) is %d\n", scalar(@Sheets);
@@ -321,7 +345,7 @@ print "not " unless $Sheets->{Count} == @Sheets;
 printf "ok %d\n", ++$Test;
 undef @Sheets;
 
-# 33. Enumerate all application properties using the C<keys> function
+# 34. Enumerate all application properties using the C<keys> function
 my @Properties = keys %$Excel;
 printf "# Number of Excel application properties: %d\n", scalar(@Properties);
 $Value = grep /^(Parent|Xyzzy|Name)$/, @Properties;
@@ -330,7 +354,7 @@ print "not " unless $Value == 2;
 printf "ok %d\n", ++$Test;
 undef @Properties;
 
-# 34. Translate character from ANSI -> OEM
+# 35. Translate character from ANSI -> OEM
 my ($Version) = $Excel->{Version} =~ /([0-9.]+)/;
 print "# Excel version is $Version\n";
 
@@ -349,15 +373,15 @@ printf "# ANSI is \"$ANSI\" (%d) and OEM is \"$OEM\" (%d)\n", ord($ANSI), ord($O
 print "not " unless ord($ANSI) == 163 && ord($OEM) == 156;
 printf "ok %d\n", ++$Test;
 
-# 35. Save workbook to file
+# 36. Save workbook to file
 print "not " unless $Book->SaveAs($File);
 printf "ok %d\n", ++$Test;
 
-# 36. Check if output file exists.
+# 37. Check if output file exists.
 print "not " unless -f $File;
 printf "ok %d\n", ++$Test;
 
-# 37. Access the same file object through a moniker.
+# 38. Access the same file object through a moniker.
 $Obj = Win32::OLE->GetObject($File);
 for ($Count=0 ; $Count < 5 ; ++$Count) {
     my $Type = Win32::OLE->QueryObjectType($Obj);
@@ -372,7 +396,7 @@ print "not " unless abs($Value-3.141592) < 0.00001;
 printf "ok %d\n", ++$Test;
 
 
-# 38. Get return value as Win32::OLE::Variant object
+# 39. Get return value as Win32::OLE::Variant object
 $Cell = $Obj->Worksheets('My Sheet #1')->Range('B9');
 my $Variant = Win32::OLE::Variant->new(VT_EMPTY);
 $Cell->Dispatch('Value', $Variant);
@@ -380,7 +404,7 @@ printf "# Variant is (%s,%s)\n", $Variant->Type, $Variant->Value;
 print "not " unless $Variant->Type == VT_BSTR && $Variant->Value eq 'Perl';
 printf "ok %d\n", ++$Test;
 
-# 39. Use clsid string to start OLE server
+# 40. Use clsid string to start OLE server
 undef $Value;
 eval {
     require Win32::Registry;
@@ -404,25 +428,64 @@ else {
     printf "ok %d\n", $Test;
 }
 
-# 40. Use DCOM syntax to start server (on local machine though)
+# 41. Use DCOM syntax to start server (on local machine though)
 #     This might fail (on Win95/NT3.5 if DCOM support is not installed.
-$Obj = Win32::OLE->new([Win32::NodeName, 'Excel.Application'], 'Quit');
+$Obj = Win32::OLE->new([hostname, 'Excel.Application'], 'Quit');
 $Value = (Win32::OLE->QueryObjectType($Obj))[0];
 print "# Object application is $Value\n";
 print "not " unless $Value eq 'Excel';
 printf "ok %d\n", ++$Test;
 
-# 41. Find $Excel object via EnumAllObjects()
+# 42. Find $Excel object via EnumAllObjects()
 my $Found = 0;
 $Count = Win32::OLE->EnumAllObjects(sub {
     my $Object = shift;
     my $Class = Win32::OLE->QueryObjectType($Object);
-    printf "# Object=%s Class=%s\n", overload::StrVal($Object), $Class;
-    $Found = 1 if overload::StrVal($Object) eq overload::StrVal($Excel);
+    printf "# Object=%s Class=%s\n", $Object, $Class;
+    $Found = 1 if $Object == $Excel;
 });
 print "# Count=$Count Found=$Found\n";
 print "not " unless $Found;
 printf "ok %d\n", ++$Test;
 
-# 42. Terminate server instance ("ok $Test\n" printed by Excel destructor)
+# 43. _NewEnum should normally be non-browseable
+my $Exists = grep /^_NewEnum$/, keys %{$Excel->Worksheets};
+print "# Exists=$Exists\n";
+print "not " if $Exists;
+printf "ok %d\n", ++$Test;
+
+# 44. make _NewEnum visible
+Excel->Option(_NewEnum => 1);
+$Exists = grep /^_NewEnum$/, keys %{$Excel->Worksheets};
+print "# Exists=$Exists\n";
+print "not " unless $Exists;
+printf "ok %d\n", ++$Test;
+
+# 45. _NewEnum available as a method
+@Sheets = @{$Excel->Worksheets->_NewEnum};
+print "# $_->{Name}\n" foreach @Sheets;
+print "not " unless @Sheets == 11 && grep $_->Name eq "My Sheet #1", @Sheets;
+printf "ok %d\n", ++$Test;
+
+# 46. _NewEnum available as a property
+@Sheets = @{$Excel->Worksheets->{_NewEnum}};
+print "not " unless @Sheets == 11 && grep $_->Name eq "My Sheet #1", @Sheets;
+printf "ok %d\n", ++$Test;
+
+# 47. Win32::OLE proxies are non-unique by default
+my $Application = $Excel->Application;
+my $Parent = $Excel->Parent;
+printf "# Application=%d Parent=%d\n", $Application, $Parent;
+print "not " if $Application == $Parent;
+printf "ok %d\n", ++$Test;
+
+# 48. Parent and Application property should now return the same object
+Excel->Option(_Unique => 1);
+$Application = $Excel->Application;
+$Parent = $Excel->Parent;
+printf "# Application=%d Parent=%d\n", $Application, $Parent;
+print "not " unless $Application == $Parent;
+printf "ok %d\n", ++$Test;
+
+# 49. Terminate server instance ("ok $Test\n" printed by Excel destructor)
 exit;

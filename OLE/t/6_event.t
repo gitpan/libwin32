@@ -10,6 +10,8 @@
 use strict;
 use Win32::OLE qw(EVENTS);
 
+use Cwd;
+
 $|=$^W = 1;
 
 open(ME,$0) or die $!;
@@ -19,22 +21,22 @@ close(ME);
 # 1. Create a new Excel automation server
 my ($Excel,$File);
 BEGIN {
-    $File = Win32::GetCwd . "\\test.xls";
+    $File = cwd . "\\test.xls";
+    $File =~ s#\\#/#g, chomp($File = `cygpath -w '$File'`) if $^O eq 'cygwin';
+    chomp($File = `cygpath -w '$File'`) if $^O eq 'cygwin';
     unless (-f $File) {
-	print "# $File doesn't exist! Please run test 3_ole.t first\n";
-	print "1..0\n";
+	print "1..0 # Skipped: $File doesn't exist! Please run test 3_ole.t first\n";
 	exit 0;
     }
     Win32::OLE->Option(Warn => 0);
     $Excel = Win32::OLE->new('Excel.Application', 'Quit');
     Win32::OLE->Option(Warn => 2);
     unless (defined $Excel) {
-	print "# Excel.Application not installed!\n";
 	my $Msg = Win32::OLE->LastError;
 	chomp $Msg;
 	$Msg =~ s/\n/\n\# /g;
 	print "# $Msg\n";
-	print "1..0\n";
+	print "1..0 # Skipped: Excel.Application not installed\n";
 	exit 0;
     }
 }

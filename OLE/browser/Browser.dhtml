@@ -131,10 +131,10 @@ foreach my $frame (qw(Libraries Types Members)) {
 # =================
 
 sub strcmp {
-    my ($a,$b) = @_;
+    my ($x,$y) = @_;
     # skip leading underscores and translate to lowercase
-    s/^_*(.*)/\l\1/ for $a, $b;
-    return $a cmp $b;
+    s/^_*(.*)/\l$1/ for $x, $y;
+    return $x cmp $y;
 }
 
 # showHelpfile event
@@ -173,6 +173,7 @@ my $html = <<HTML;
 	    <TD><INPUT TYPE="checkbox" $GroupByType
 		 onclick="parent.Libraries.GroupByType"></TD></TR>
     </TABLE>
+    <HR><FONT SIZE=-2>Written by Jan Dubois in 1999.</FONT>
 HTML
 
 $frame{Header}->document->body->{innerHTML} = $html;

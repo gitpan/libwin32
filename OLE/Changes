@@ -3,6 +3,28 @@ Revision history for Perl extension Win32::OLE.
 Changes in version 0.01-0.03 are by Gurusamy Sarathy. All other changes
 are by Jan Dubois unless attributed otherwise.
 
+0.13	Sat, May 6th, 2000
+	- add Win32::OLE::Variant::nothing() function
+	- fix strrev() definition for Borland
+	- changes based on ideas and patches from Rudi Farkas
+          <rudolf.farkas@lecroy.com>:
+	  - add _Unique option to prevent creating duplicate proxy Win32::OLE
+	    objects for the same COM object
+	  - add _NewEnum option to add a visible _NewEnum property to
+	    collection objects.
+
+0.12	Thu, April 13th, 2000
+	- remove call to CoFreeUnusedLibraries from ReleasePerlObject
+	- added Win32::OLE->FreeUnusedLibraries() class method
+	- fix Variant->Put() support for SAFEARRAYs of BSTR/DISPATCH/UNKNOWN
+	- fix error message: "argument %" for Invoke was of by one
+	- support setting Warn option to CODE reference
+	  (suggested by Tobias Martinsson <tobias@100procent.com>)
+	- TPJ article added
+	- add CYGWIN support (by Eric Fifer <EFifer@sanwaint.com>)
+	- changed handling of VT_DATE and VT_ERROR Variants to return a
+	  Win32::OLE::Variant object (by Eric Fifer)
+
 0.1101	libwin32-0.15 / ActivePerl build 520
 	- VarAdd() etc. temporarily removed for VC++ 5.0 compatibility
 
@@ -304,7 +326,7 @@ are by Jan Dubois unless attributed otherwise.
 
 0.04  Sun Oct 12 23:03:32 1997 (unreleased)
 	- support for unnamed default methods (thanks to
-	  Doug Lankshear <Doug_Lankshear@ActiveState.com>)
+	  Doug Lankshear <DougL@ActiveState.com>)
 	- CreateVariantFromSV is more robust now
 	- support for omitting optional params with "undef"
 	- named arguments can be specified as a hash ref

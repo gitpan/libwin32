@@ -45,6 +45,15 @@
 extern "C" {
 #endif
 
+#ifdef __CYGWIN__
+#   undef WIN32			/* don't use with Cygwin & Perl */
+#   include <netdb.h>
+#   include <sys/socket.h>
+#   include <unistd.h>
+#   define strrev _strrev
+    char *_strrev(char*);	/* from string.h (msvcrt40) */
+#endif
+
 #define MIN_PERL_DEFINE
 #define NO_XSLOCKS
 #include "EXTERN.h"
@@ -75,6 +84,10 @@ typedef unsigned short WORD;
 #   define CPERLarg_
 #   define PERL_OBJECT_THIS
 #   define PERL_OBJECT_THIS_
+#endif
+
+#ifndef pTHX_
+#   define pTHX_
 #endif
 
 #undef THIS_
@@ -127,6 +140,10 @@ static char CP_NAME[] = "CP";
 static const int CP_LEN = sizeof(CP_NAME)-1;
 static char WARN_NAME[] = "Warn";
 static const int WARN_LEN = sizeof(WARN_NAME)-1;
+static char _NEWENUM_NAME[] = "_NewEnum";
+static const int _NEWENUM_LEN = sizeof(_NEWENUM_NAME)-1;
+static char _UNIQUE_NAME[] = "_Unique";
+static const int _UNIQUE_LEN = sizeof(_UNIQUE_NAME)-1;
 static char LASTERR_NAME[] = "LastError";
 static const int LASTERR_LEN = sizeof(LASTERR_NAME)-1;
 static char TIE_NAME[] = "Tie";
@@ -151,6 +168,7 @@ typedef struct
     CRITICAL_SECTION CriticalSection;
     OBJECTHEADER *pObj;
     BOOL bInitialized;
+    HV *hv_unique;
 
     /* DCOM function addresses are resolved dynamically */
     HINSTANCE hOLE32;
@@ -189,6 +207,7 @@ static PERINTERP Interp;
 #define g_pObj            (INTERP->pObj)
 #define g_bInitialized    (INTERP->bInitialized)
 #define g_CriticalSection (INTERP->CriticalSection)
+#define g_hv_unique       (INTERP->hv_unique)
 
 #define g_hOLE32                (INTERP->hOLE32)
 #define g_pfnCoInitializeEx     (INTERP->pfnCoInitializeEx)
@@ -209,13 +228,16 @@ typedef struct _tagOBJECTHEADER
 #endif
 }   OBJECTHEADER;
 
+#define OBJFLAG_DESTROYED 0x01
+#define OBJFLAG_UNIQUE    0x02
+
 /* Win32::OLE object */
 class EventSink;
 typedef struct
 {
     OBJECTHEADER header;
 
-    BOOL bDestroyed;
+    UV flags;
     IDispatch *pDispatch;
     ITypeInfo *pTypeInfo;
     IEnumVARIANT *pEnum;
@@ -451,7 +473,7 @@ SpinMessageLoop(void)
     MSG msg;
 
     DBG(("SpinMessageLoop\n"));
-    while(PeekMessage(&msg,NULL,NULL,NULL,PM_REMOVE)) {
+    while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) {
 	TranslateMessage(&msg);
 	DispatchMessage(&msg);
     }
@@ -503,7 +525,7 @@ IsLocalMachine(CPERLarg_ char *pszMachine)
 	++count;
 
     New(0, pLocal, 4*count, char);
-    for (index = 0 ; index < count ; ++index)
+    for (index = 0; index < count; ++index)
 	memcpy(pLocal+4*index, pHostEnt->h_addr_list[index], 4);
 
     /* Determine addresses of remote machine */
@@ -527,7 +549,7 @@ IsLocalMachine(CPERLarg_ char *pszMachine)
 
     /* Compare list of addresses of remote machine against local addresses */
     while (*ppRemote) {
-	for (index = 0 ; index < count ; ++index)
+	for (index = 0; index < count; ++index)
 	    if (memcmp(pLocal+4*index, *ppRemote, 4) == 0) {
 		Safefree(pLocal);
 		return TRUE;
@@ -733,10 +755,11 @@ QueryPkgVar(CPERLarg_ HV *stash, char *var, STRLEN len, IV def=0)
     GV **gv = (GV**)hv_fetch(stash, var, len, FALSE);
 
     if (gv && (sv = GvSV(*gv)) != NULL && SvIOK(sv)) {
-	DBG(("QueryPkgVar(%s) returns %d\n", var, SvIV(sv)));
+	DBG(("QueryPkgVar(%s::%s) returns %d\n", HvNAME(stash), var, SvIV(sv)));
 	return SvIV(sv);
     }
 
+    DBG(("QueryPkgVar(%s::%s) default %d\n", HvNAME(stash), var, def));
     return def;
 }
 
@@ -768,8 +791,15 @@ ReportOleError(CPERLarg_ HV *stash, HRESULT hr, EXCEPINFO *pExcep=NULL,
 {
     dSP;
 
+    SV *sv;
     IV warnlvl = QueryPkgVar(THIS_ stash, WARN_NAME, WARN_LEN);
-    SV *sv = sv_2mortal(newSV(200));
+    GV **pgv = (GV**)hv_fetch(stash, WARN_NAME, WARN_LEN, FALSE);
+    CV *cv = Nullcv;
+
+    if (pgv && (sv = GvSV(*pgv)) && SvROK(sv) && SvTYPE(SvRV(sv)) == SVt_PVCV)
+	cv = (CV*)sv;
+
+    sv = sv_2mortal(newSV(200));
     SvPOK_on(sv);
 
     /* start with exception info */
@@ -841,7 +871,7 @@ ReportOleError(CPERLarg_ HV *stash, HRESULT hr, EXCEPINFO *pExcep=NULL,
     char *pch = SvPVX(sv);
     int  cch;
 
-    for (cch = 0 ; *pch ; ++pch, ++cch) {
+    for (cch = 0; *pch; ++pch, ++cch) {
 	if (*pch == ' ') {
 	    pLastBlank = pch;
 	}
@@ -860,8 +890,7 @@ ReportOleError(CPERLarg_ HV *stash, HRESULT hr, EXCEPINFO *pExcep=NULL,
 
     DBG(("ReportOleError: hr=0x%08x warnlvl=%d\n%s", hr, warnlvl, SvPVX(sv)));
 
-    if (warnlvl > 1 || (warnlvl == 1 && PL_dowarn)) {
-	CV *cv;
+    if (!cv && (warnlvl > 1 || (warnlvl == 1 && PL_dowarn))) {
 	if (warnlvl < 3) {
 	    cv = perl_get_cv("Carp::carp", FALSE);
 	    if (!cv)
@@ -872,12 +901,13 @@ ReportOleError(CPERLarg_ HV *stash, HRESULT hr, EXCEPINFO *pExcep=NULL,
 	    if (!cv)
 		croak(SvPVX(sv));
 	}
-	if (cv) {
-	    PUSHMARK(sp) ;
-	    XPUSHs(sv);
-	    PUTBACK;
-	    perl_call_sv((SV*)cv, G_DISCARD);
-	}
+    }
+
+    if (cv) {
+        PUSHMARK(sp);
+        XPUSHs(sv);
+        PUTBACK;
+        perl_call_sv((SV*)cv, G_DISCARD);
     }
 
 }   /* ReportOleError */
@@ -962,7 +992,20 @@ RemoveFromObjectChain(CPERLarg_ OBJECTHEADER *pHeader)
 SV *
 CreatePerlObject(CPERLarg_ HV *stash, IDispatch *pDispatch, SV *destroy)
 {
+    dPERINTERP;
+
     /* returns a mortal reference to a new Perl OLE object */
+
+    IV unique = QueryPkgVar(THIS_ stash, _UNIQUE_NAME, _UNIQUE_LEN);
+    if (unique) {
+        IUnknown *punk; // XXX check error?
+        pDispatch->QueryInterface(IID_IUnknown, (void**)&punk);
+        SV **svp = hv_fetch(g_hv_unique, (char*)&punk, sizeof(punk), FALSE);
+        DBG(("hv_fetch(%08x) returned %08x", punk, svp));
+        punk->Release();
+        if (svp)
+            return sv_2mortal(sv_bless(newRV((SV*)SvIV(*svp)), stash));
+    }
 
     if (!pDispatch) {
 	warn(MY_VERSION ": CreatePerlObject() No IDispatch interface");
@@ -974,14 +1017,14 @@ CreatePerlObject(CPERLarg_ HV *stash, IDispatch *pDispatch, SV *destroy)
     HV *hvinner = newHV();
     SV *inner;
     SV *sv;
-    GV **gv = (GV **) hv_fetch(stash, TIE_NAME, TIE_LEN, FALSE);
+    GV **gv = (GV**)hv_fetch(stash, TIE_NAME, TIE_LEN, FALSE);
     char *szTie = szWINOLETIE;
 
     if (gv && (sv = GvSV(*gv)) != NULL && SvPOK(sv))
 	szTie = SvPV_nolen(sv);
 
     New(0, pObj, 1, WINOLEOBJECT);
-    pObj->bDestroyed = FALSE;
+    pObj->flags = 0;
     pObj->pDispatch = pDispatch;
     pObj->pTypeInfo = NULL;
     pObj->pEnum = NULL;
@@ -997,12 +1040,23 @@ CreatePerlObject(CPERLarg_ HV *stash, IDispatch *pDispatch, SV *destroy)
 	    pObj->destroy = newRV_inc(SvRV(destroy));
     }
 
+    if (unique) {
+        IUnknown *punk; // XXX check error?
+        pDispatch->QueryInterface(IID_IUnknown, (void**)&punk);
+        /* use XIV as a weak reference */
+        SV **svp = hv_store(g_hv_unique, (char*)&punk, sizeof(punk),
+                            newSViv((IV)pObj->self), 0);
+        DBG(("hv_store(%08x) returned %08x", punk, svp));
+        punk->Release();
+        pObj->flags |= OBJFLAG_UNIQUE;
+    }
+
     AddToObjectChain(THIS_ &pObj->header, WINOLE_MAGIC);
 
-    DBG(("CreatePerlObject = |%lx| Class = %s Tie = %s\n", pObj,
-	 HvNAME(stash), szTie));
+    DBG(("CreatePerlObject=|%lx| Class=%s Tie=%s pDispatch=0x%x\n", pObj,
+	 HvNAME(stash), szTie, pDispatch));
 
-    hv_store(hvinner, PERL_OLE_ID, PERL_OLE_IDLEN, newSViv((long)pObj), 0);
+    hv_store(hvinner, PERL_OLE_ID, PERL_OLE_IDLEN, newSViv((IV)pObj), 0);
     inner = sv_bless(newRV_noinc((SV*)hvinner), gv_stashpv(szTie, TRUE));
     sv_magic((SV*)pObj->self, inner, 'P', Nullch, 0);
     SvREFCNT_dec(inner);
@@ -1015,6 +1069,7 @@ void
 ReleasePerlObject(CPERLarg_ WINOLEOBJECT *pObj)
 {
     dSP;
+    HV *stash = SvSTASH(pObj->self);
 
     DBG(("ReleasePerlObject |%lx|", pObj));
 
@@ -1030,10 +1085,10 @@ ReleasePerlObject(CPERLarg_ WINOLEOBJECT *pObj)
 	SV *self = sv_2mortal(newRV_inc((SV*)pObj->self));
 
 	/* honour OVERLOAD setting */
-	if (Gv_AMG(SvSTASH(pObj->self)))
+	if (Gv_AMG(stash))
 	    SvAMAGIC_on(self);
 
-	DBG(("Calling destroy method for object |%lx|\n", pObj));
+	DBG((" Calling destroy method for object |%lx|\n", pObj));
 	ENTER;
 	if (SvPOK(pObj->destroy)) {
 	    /* $self->Dispatch($destroy,$retval); */
@@ -1048,37 +1103,46 @@ ReleasePerlObject(CPERLarg_ WINOLEOBJECT *pObj)
 	else {
 	    /* &$destroy($self); */
 	    PUSHMARK(sp);
-	    XPUSHs(self) ;
+	    XPUSHs(self);
 	    PUTBACK;
 	    perl_call_sv(pObj->destroy, G_DISCARD);
 	}
 	LEAVE;
-	DBG(("Returned from destroy method for 0x%08x\n", pObj));
+	DBG((" Returned from destroy method for 0x%08x\n", pObj));
 
 	SvREFCNT_dec(pObj->destroy);
 	pObj->destroy = NULL;
     }
 
+    if (pObj->flags & OBJFLAG_UNIQUE) {
+        dPERINTERP;
+        IUnknown *punk; // XXX check error?
+        pObj->pDispatch->QueryInterface(IID_IUnknown, (void**)&punk);
+        hv_delete(g_hv_unique, (char*)&punk, sizeof(punk), G_DISCARD);
+        DBG((" hv_delete(%08x)", punk));
+        punk->Release();
+    }
+
     if (pObj->pEventSink) {
-	DBG(("Unadvise connection |%lx|", pObj));
+	DBG((" Unadvise connection |%lx|", pObj));
 	pObj->pEventSink->Unadvise();
 	pObj->pEventSink = NULL;
     }
 
     if (pObj->pDispatch) {
-	DBG((" pDispatch"));
+	DBG((" Release pDispatch"));
 	pObj->pDispatch->Release();
 	pObj->pDispatch = NULL;
     }
 
     if (pObj->pTypeInfo) {
-	DBG((" pTypeInfo"));
+	DBG((" Release pTypeInfo"));
 	pObj->pTypeInfo->Release();
 	pObj->pTypeInfo = NULL;
     }
 
     if (pObj->pEnum) {
-	DBG((" pEnum"));
+	DBG((" Release pEnum"));
 	pObj->pEnum->Release();
 	pObj->pEnum = NULL;
     }
@@ -1096,9 +1160,6 @@ ReleasePerlObject(CPERLarg_ WINOLEOBJECT *pObj)
     }
 
     DBG(("\n"));
-
-    SpinMessageLoop();
-    CoFreeUnusedLibraries();
 
 }   /* ReleasePerlObject */
 
@@ -1307,7 +1368,7 @@ FetchTypeInfo(CPERLarg_ WINOLEOBJECT *pObj)
 	pTypeInfo->ReleaseTypeAttr(pTypeAttr);
 	pTypeAttr = NULL;
 
-	for (int i=0 ; i < cImplTypes ; ++i) {
+	for (int i=0; i < cImplTypes; ++i) {
 	    HREFTYPE hreftype;
 	    ITypeInfo *pRefTypeInfo;
 
@@ -1370,6 +1431,7 @@ NextPropertyName(CPERLarg_ WINOLEOBJECT *pObj)
 
     HV *stash = SvSTASH(pObj->self);
     UINT cp = QueryPkgVar(THIS_ stash, CP_NAME, CP_LEN, cpDefault);
+    int newenum = QueryPkgVar(THIS_ stash, _NEWENUM_NAME, _NEWENUM_LEN);
 
     while (pObj->PropIndex < pObj->cFuncs+pObj->cVars) {
 	ULONG index = pObj->PropIndex++;
@@ -1380,6 +1442,9 @@ NextPropertyName(CPERLarg_ WINOLEOBJECT *pObj)
 	    hr = pObj->pTypeInfo->GetFuncDesc(index, &pFuncDesc);
 	    if (CheckOleError(THIS_ stash, hr))
 		continue;
+
+            if (newenum && pFuncDesc->memid == DISPID_NEWENUM)
+                return newSVpv("_NewEnum", 8);
 
 	    if (!(pFuncDesc->funckind & FUNC_DISPATCH) ||
 		!(pFuncDesc->invkind & INVOKE_PROPERTYGET) ||
@@ -1996,8 +2061,8 @@ EventSink::Invoke(
 	if (Gv_AMG(SvSTASH(m_pObj->self)))
 	    SvAMAGIC_on(self);
 
-	ENTER ;
-	SAVETMPS ;
+	ENTER;
+	SAVETMPS;
 	PUSHMARK(sp);
 	XPUSHs(sv_2mortal(self));
 	if (pushname)
@@ -2013,8 +2078,8 @@ EventSink::Invoke(
 	PUTBACK;
 	perl_call_sv(callback, G_DISCARD);
 	SPAGAIN;
-	FREETMPS ;
-	LEAVE ;
+	FREETMPS;
+	LEAVE;
     }
 
     return S_OK;
@@ -2123,8 +2188,8 @@ Forwarder::Invoke(
     DBG(("Forwarder::Invoke dispid=%d args=%d\n",
 	 dispidMember, pdispparams->cArgs));
     dSP;
-    ENTER ;
-    SAVETMPS ;
+    ENTER;
+    SAVETMPS;
     PUSHMARK(sp);
     for (int i=0; i < pdispparams->cArgs; ++i) {
 	VARIANT *pVariant = &pdispparams->rgvarg[pdispparams->cArgs-i-1];
@@ -2137,8 +2202,8 @@ Forwarder::Invoke(
     PUTBACK;
     perl_call_sv(m_method, G_DISCARD);
     SPAGAIN;
-    FREETMPS ;
-    LEAVE ;
+    FREETMPS;
+    LEAVE;
     return S_OK;
 }
 
@@ -2203,7 +2268,7 @@ SetSafeArrayFromAV(CPERLarg_ AV* av, VARTYPE vt, SAFEARRAY *psa,
     if (vt != VT_VARIANT)
 	V_VT(pElement) = vt | VT_BYREF;
 
-    for (int index = 0 ; index >= 0 ; ) {
+    for (int index = 0; index >= 0; ) {
 	SV **psv = av_fetch(pav[index], pix[index], FALSE);
 
 	if (psv) {
@@ -2320,7 +2385,7 @@ SetVariantFromSVEx(CPERLarg_ SV* sv, VARIANT *pVariant, UINT cp, LCID lcid)
 	psab[0].lLbound = 0;
 
 	/* Depth first walk through to determine number of dimensions */
-	for (index = 0 ; index >= 0 ; ) {
+	for (index = 0; index >= 0; ) {
 	    SV **psv = av_fetch(pav[index], pix[index], FALSE);
 
 	    if (psv && SvROK(*psv) && SvTYPE(SvRV(*psv)) == SVt_PVAV) {
@@ -2749,7 +2814,7 @@ SetSVFromVariantEx(CPERLarg_ VARIANTARG *pVariant, SV* sv, HV *stash,
 		}
 		av_push(pav[dim-1], val);
 
-		for (index = dim-1 ; index >= 0 ; --index) {
+		for (index = dim-1; index >= 0; --index) {
 		    if (++pArrayIndex[index] <= pUpperBound[index])
 			break;
 
@@ -2767,7 +2832,7 @@ SetSVFromVariantEx(CPERLarg_ VARIANTARG *pVariant, SV* sv, HV *stash,
 		hr = hr2;
 	}
 
-	for (index = 1 ; index < dim ; ++index)
+	for (index = 1; index < dim; ++index)
 	    SvREFCNT_dec((SV*)pav[index]);
 
 	if (SUCCEEDED(hr))
@@ -2822,8 +2887,27 @@ SetSVFromVariantEx(CPERLarg_ VARIANTARG *pVariant, SV* sv, HV *stash,
     }
 
     case VT_ERROR:
-	SET(iv, ERROR);
-	break;
+    case VT_DATE:
+    {
+	SV *classname;
+	WINOLEVARIANTOBJECT *pVarObj;
+	Newz(0, pVarObj, 1, WINOLEVARIANTOBJECT);
+	VariantInit(&pVarObj->variant);
+	VariantInit(&pVarObj->byref);
+	hr = VariantCopy(&pVarObj->variant, pVariant);
+	if (FAILED(hr)) {
+	    Safefree(pVarObj);
+	    ReportOleError(THIS_ stash, hr, NULL, NULL);
+            break;
+	}
+
+	AddToObjectChain(THIS_ (OBJECTHEADER*)pVarObj, WINOLEVARIANT_MAGIC);
+	classname = newSVpv(HvNAME(stash), 0);
+	sv_catpvn(classname, "::Variant", 9);
+	sv_setref_pv(sv, SvPVX(classname), pVarObj);
+	SvREFCNT_dec(classname);
+ 	break;
+    }
 
     case VT_BOOL:
 	if (V_ISBYREF(pVariant))
@@ -2877,7 +2961,6 @@ SetSVFromVariantEx(CPERLarg_ VARIANTARG *pVariant, SV* sv, HV *stash,
 	break;
     }
 
-    case VT_DATE:
     case VT_CY:
     default:
     {
@@ -3034,7 +3117,6 @@ Uninitialize(CPERLarg_ PERINTERP *pInterp)
 	    pHeader = pHeader->pNext;
 	}
 
-	SpinMessageLoop();
 	DBG(("CoUninitialize\n"));
 	if (g_pfnCoUninitialize)
 	    g_pfnCoUninitialize();
@@ -3045,7 +3127,7 @@ Uninitialize(CPERLarg_ PERINTERP *pInterp)
 }   /* Uninitialize */
 
 static void
-AtExit(CPERLarg_ void *pVoid)
+AtExit(pTHX_ CPERLarg_ void *pVoid)
 {
     PERINTERP *pInterp = (PERINTERP*)pVoid;
 
@@ -3083,6 +3165,7 @@ Bootstrap(CPERLarg)
 
     g_pObj = NULL;
     g_bInitialized = FALSE;
+    g_hv_unique = newHV();
     InitializeCriticalSection(&g_CriticalSection);
 
     g_hOLE32 = LoadLibrary("OLE32");
@@ -3138,7 +3221,7 @@ CallObjectMethod(CPERLarg_ SV **mark, I32 ax, I32 items, char *pszMethod)
      */
     PUSHMARK(mark);
     EXTEND(sp,2);
-    for (I32 item = 1 ; item < items ; ++item)
+    for (I32 item = 1; item < items; ++item)
 	ST(2+items-item) = ST(items-item);
     sp += 2;
 
@@ -3174,9 +3257,15 @@ Initialize(...)
 ALIAS:
     Uninitialize = 1
     SpinMessageLoop = 2
+    MessageLoop = 3
+    QuitMessageLoop = 4
+    FreeUnusedLibraries = 5
+    _Unique = 6
 PPCODE:
 {
-    char *paszMethod[] = {"Initialize", "Uninitialize", "SpinMessageLoop"};
+    char *paszMethod[] = {"Initialize", "Uninitialize", "SpinMessageLoop",
+                          "MessageLoop", "QuitMessageLoop",
+			  "FreeUnusedLibraries", "_Unique"};
 
     if (CallObjectMethod(THIS_ mark, ax, items, paszMethod[ix]))
 	return;
@@ -3192,7 +3281,7 @@ PPCODE:
     SetLastOleError(THIS_ stash);
 
     switch (ix) {
-    case 0: {
+    case 0: {		// Initialize
 	DWORD dwCoInit = COINIT_MULTITHREADED;
 	if (items > 1 && SvOK(ST(1)))
 	    dwCoInit = SvIV(ST(1));
@@ -3200,14 +3289,39 @@ PPCODE:
 	Initialize(THIS_ gv_stashsv(ST(0), TRUE), dwCoInit);
 	break;
     }
-    case 1: {
+    case 1: {		// Uninitialize
 	dPERINTERP;
 	Uninitialize(THIS_ INTERP);
 	break;
     }
-    case 2:
+    case 2:		// SpinMessageLoop
 	SpinMessageLoop();
 	break;
+
+    case 3: {		// MessageLoop
+	MSG msg;
+	DBG(("MessageLoop\n"));
+	while (GetMessage(&msg, NULL, 0, 0)) {
+	    if (msg.hwnd == NULL && msg.message == WM_USER)
+		break;
+	    TranslateMessage(&msg);
+	    DispatchMessage(&msg);
+	}
+	break;
+    }
+    case 4:		// QuitMessageLoop
+	PostThreadMessage(GetCurrentThreadId(), WM_USER, 0, 0);
+	break;
+
+    case 5:		// FreeUnusedLibraries
+	CoFreeUnusedLibraries();
+	break;
+
+    case 6: {		// _Unique
+        dPERINTERP;
+	hv_undef(g_hv_unique);
+	break;
+    }
     }
 
     XSRETURN_EMPTY;
@@ -3345,7 +3459,7 @@ PPCODE:
 	 pObj ? pObj->pDispatch : NULL));
     if (pObj) {
 	ReleasePerlObject(THIS_ pObj);
-	pObj->bDestroyed = TRUE;
+	pObj->flags |= OBJFLAG_DESTROYED;
     }
     XSRETURN_EMPTY;
 }
@@ -3407,6 +3521,21 @@ PPCODE:
     if (SvPOK(method)) {
 	buffer = SvPV(method, length);
 	if (length > 0) {
+            int newenum = QueryPkgVar(THIS_ stash, _NEWENUM_NAME, _NEWENUM_LEN);
+            if (newenum && strEQ(buffer, "_NewEnum")) {
+                AV *av = newAV();
+                PUSHMARK(sp);
+                PUSHs(sv_2mortal(newSVpv(szWINOLEENUM, 0)));
+                PUSHs(self);
+                PUTBACK;
+                items = perl_call_method("All", G_ARRAY);
+                SPAGAIN;
+                for (index=0; index<items; ++index)
+                    av_push(av, newSVsv(ST(index)));
+                sv_setsv(retval, sv_2mortal(newRV_noinc((SV*)av)));
+		XSRETURN_YES;
+            }
+
 	    hr = GetHashedDispID(THIS_ pObj, buffer, length, dispID, lcid, cp);
 	    if (FAILED(hr)) {
 		if (PL_hints & HINT_STRICT_SUBS) {
@@ -3447,7 +3576,7 @@ PPCODE:
 	New(0, rghe, dispParams.cNamedArgs, HE*);
 	New(0, dispParams.rgdispidNamedArgs, dispParams.cNamedArgs, DISPID);
 	New(0, dispParams.rgvarg, dispParams.cArgs, VARIANTARG);
-	for (index = 0 ; index < dispParams.cArgs ; ++index)
+	for (index = 0; index < dispParams.cArgs; ++index)
 	    VariantInit(&dispParams.rgvarg[index]);
 
 	New(0, rgszNames, 1+dispParams.cNamedArgs, OLECHAR*);
@@ -3477,12 +3606,12 @@ PPCODE:
 	    unsigned int cErrors = 0;
 	    unsigned int error = 0;
 
-	    for (index = 1 ; index <= dispParams.cNamedArgs ; ++index)
+	    for (index = 1; index <= dispParams.cNamedArgs; ++index)
 		if (rgdispids[index] == DISPID_UNKNOWN)
 		   ++cErrors;
 
 	    err = sv_2mortal(newSVpv("",0));
-	    for (index = 1 ; index <= dispParams.cNamedArgs ; ++index)
+	    for (index = 1; index <= dispParams.cNamedArgs; ++index)
 		if (rgdispids[index] == DISPID_UNKNOWN) {
 		    if (error++ > 0)
 			sv_catpv(err, error == cErrors ? " and " : ", ");
@@ -3505,7 +3634,7 @@ PPCODE:
     if (dispParams.cArgs > dispParams.cNamedArgs) {
 	if (!dispParams.rgvarg) {
 	    New(0, dispParams.rgvarg, dispParams.cArgs, VARIANTARG);
-	    for (index = 0 ; index < dispParams.cArgs ; ++index)
+	    for (index = 0; index < dispParams.cArgs; ++index)
 		VariantInit(&dispParams.rgvarg[index]);
 	}
 
@@ -3587,7 +3716,7 @@ PPCODE:
 		sv_catpvf(err, " argument \"%s\"",
 			  hv_iterkey(rghe[argErr], &len));
 	    else
-		sv_catpvf(err, " argument %d", 1 + dispParams.cArgs - argErr);
+		sv_catpvf(err, " argument %d", dispParams.cArgs - argErr);
 	}
     }
 
@@ -4126,7 +4255,7 @@ PPCODE:
 
     if (pObj) {
 	/* objects may be destroyed in the wrong order during global cleanup */
-	if (!pObj->bDestroyed) {
+	if (!(pObj->flags & OBJFLAG_DESTROYED)) {
 	    DBG(("Win32::OLE::Tie::DESTROY: OLE object not yet destroyed\n"));
 	    if (pObj->pDispatch) {
 		/* make sure the reference to the tied hash is still valid */
@@ -4169,7 +4298,7 @@ PPCODE:
     }
 
     WINOLEOBJECT *pObj = GetOleObject(THIS_ self);
-    DBG(("Win32::OLE::Tie::Fetch(0x%08x,'%s',%d)\n", pObj, buffer));
+    DBG(("Win32::OLE::Tie::Fetch(0x%08x,'%s')\n", pObj, buffer));
     if (!pObj)
 	XSRETURN_EMPTY;
 
@@ -4439,7 +4568,7 @@ PPCODE:
 
     /* loop through all objects in type lib */
     count = pObj->pTypeLib->GetTypeInfoCount();
-    for (int index=0 ; index < count ; ++index) {
+    for (int index=0; index < count; ++index) {
 	ITypeInfo *pTypeInfo;
 	TYPEATTR  *pTypeAttr;
 
@@ -4454,7 +4583,7 @@ PPCODE:
 	    continue;
 	}
 
-	for (int iVar=0 ; iVar < pTypeAttr->cVars ; ++iVar) {
+	for (int iVar=0; iVar < pTypeAttr->cVars; ++iVar) {
 	    VARDESC *pVarDesc;
 
 	    hr = pTypeInfo->GetVarDesc(iVar, &pVarDesc);
@@ -4944,6 +5073,13 @@ PPCODE:
     if (SUCCEEDED(hr)) {
 	ST(0) = sv_newmortal();
 	hr = SetSVFromVariantEx(THIS_ &variant, ST(0), olestash);
+    }
+    else if (V_VT(&pVarObj->variant) == VT_ERROR) {
+	/* special handling for VT_ERROR */
+	ST(0) = sv_newmortal();
+	V_VT(&variant) = VT_I4;
+	V_I4(&variant) = V_ERROR(&pVarObj->variant);
+	hr = SetSVFromVariantEx(THIS_ &variant, ST(0), olestash, FALSE);
     }
     VariantClear(&variant);
     CheckOleError(THIS_ olestash, hr);
@@ -5463,8 +5599,15 @@ PPCODE:
     V_VT(&byref) = vt_base;
     if (vt_base == VT_VARIANT)
         V_VARIANTREF(&variant) = &byref;
-    else
+    else {
         V_BYREF(&variant) = &V_BYREF(&byref);
+	if (vt_base == VT_BSTR)
+	    V_BSTR(&byref) = NULL;
+	else if (vt_base == VT_DISPATCH)
+	    V_DISPATCH(&byref) = NULL;
+	else if (vt_base == VT_UNKNOWN)
+	    V_UNKNOWN(&byref) = NULL;
+    }
 
     HRESULT hr = S_OK;
     if (ix == 0) { /* Get */
@@ -5480,8 +5623,16 @@ PPCODE:
 	LCID lcid = QueryPkgVar(THIS_ olestash, LCID_NAME, LCID_LEN,
 				lcidDefault);
 	hr = AssignVariantFromSV(THIS_ ST(items-1), &variant, cp, lcid);
-	if (SUCCEEDED(hr))
-	    hr = SafeArrayPutElement(psa, rgIndices, V_BYREF(&variant));
+	if (SUCCEEDED(hr)) {
+	    if (vt_base == VT_BSTR)
+		hr = SafeArrayPutElement(psa, rgIndices, V_BSTR(&byref));
+	    else if (vt_base == VT_DISPATCH)
+		hr = SafeArrayPutElement(psa, rgIndices, V_DISPATCH(&byref));
+	    else if (vt_base == VT_UNKNOWN)
+		hr = SafeArrayPutElement(psa, rgIndices, V_UNKNOWN(&byref));
+	    else
+		hr = SafeArrayPutElement(psa, rgIndices, V_BYREF(&variant));
+	}
 	if (SUCCEEDED(hr))
 	    ST(0) = sv_mortalcopy(self);
     }
@@ -5578,7 +5729,7 @@ PPCODE:
 	    STRLEN olecharlen = SysStringLen(bstr);
 	    SV *sv = newSVpv((char*)bstr, 2*olecharlen);
 	    U16 *pus = (U16*)SvPVX(sv);
-	    for (STRLEN i=0 ; i < olecharlen ; ++i)
+	    for (STRLEN i=0; i < olecharlen; ++i)
 		pus[i] = htons(pus[i]);
 
 	    ST(0) = sv_2mortal(sv_bless(newRV_noinc(sv),
@@ -5668,7 +5819,7 @@ PPCODE:
     New(0, pCharType, len, unsigned short);
     if (GetStringTypeA(lcid, type, string, len, pCharType)) {
 	EXTEND(sp, len);
-	for (int i=0 ; i < len ; ++i)
+	for (int i=0; i < len; ++i)
 	    PUSHs(sv_2mortal(newSViv(pCharType[i])));
     }
     Safefree(pCharType);
@@ -6214,7 +6365,7 @@ PPCODE:
 	XSRETURN_EMPTY;
 
     AV *av = newAV();
-    for (int i = 0 ; i < cNames ; ++i) {
+    for (int i = 0; i < cNames; ++i) {
 	char szName[32];
 	// XXX use correct codepage ???
 	char *pszName = GetMultiByte(THIS_ rgbstr[i],
